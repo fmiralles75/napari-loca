@@ -1,0 +1,109 @@
+# this file defines how your widgets are exposed to napari
+
+name: napari-organelle-contact-analyzer
+display_name: Napari Organelle Contact Analyzer
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/manifest.html for valid categories
+categories: ["Annotation", "Segmentation", "Acquisition"]
+contributions:
+  commands:
+    - id: napari-organelle-contact-analyzer.get_reader
+      python_name: napari_organelle_contact_analyzer._reader:napari_get_reader
+      title: Open data with Napari Organelle Contact Analyzer
+    - id: napari-organelle-contact-analyzer.write_multiple
+      python_name: napari_organelle_contact_analyzer._writer:write_multiple
+      title: Save multi-layer data with Napari Organelle Contact Analyzer
+    - id: napari-organelle-contact-analyzer.write_single_image
+      python_name: napari_organelle_contact_analyzer._writer:write_single_image
+      title: Save image data with Napari Organelle Contact Analyzer
+    - id: napari-organelle-contact-analyzer.make_sample_data
+      python_name: napari_organelle_contact_analyzer._sample_data:make_sample_data
+      title: Load sample data from Napari Organelle Contact Analyzer
+    - id: napari-organelle-contact-analyzer.make_container_widget
+      python_name: napari_organelle_contact_analyzer:ImageThreshold
+      title: Make threshold Container widget
+    - id: napari-organelle-contact-analyzer.make_magic_widget
+      python_name: napari_organelle_contact_analyzer:threshold_magic_widget
+      title: Make threshold magic widget
+    - id: napari-organelle-contact-analyzer.make_function_widget
+      python_name: napari_organelle_contact_analyzer:threshold_autogenerate_widget
+      title: Make threshold function widget
+    - id: napari-organelle-contact-analyzer.make_qwidget
+      python_name: napari_organelle_contact_analyzer:ExampleQWidget
+      title: Make example QWidget
+      # Here's a sample of how we would implement new widgets to napari
+    - id: napari-organelle-contact-analyzer.make_contact_analyzer
+      python_name: napari_organelle_contact_analyzer._widget:OrganelleContactWidget
+      title: Make Contact Analyzer Widget
+    # - id: napari-organelle-contact-analyzer.make_contact_filter
+    #   python_name: napari_organelle_contact_analyzer.widget:contact_filter_widget
+    #   title: Make Contact Filter Widget
+  readers:
+    - command: napari-organelle-contact-analyzer.get_reader
+      accepts_directories: false
+      filename_patterns: ['*.npy', '*.nd2']
+  writers:
+    - command: napari-organelle-contact-analyzer.write_multiple
+      layer_types: ['image*','labels*']
+      filename_extensions: []
+    - command: napari-organelle-contact-analyzer.write_single_image
+      layer_types: ['image']
+      filename_extensions: ['.npy']
+  sample_data:
+    - command: napari-organelle-contact-analyzer.make_sample_data
+      display_name: Napari Organelle Contact Analyzer
+      key: unique_id.1
+  widgets:
+    - command: napari-organelle-contact-analyzer.make_container_widget
+      display_name: Container Threshold
+    - command: napari-organelle-contact-analyzer.make_magic_widget
+      display_name: Magic Threshold
+    - command: napari-organelle-contact-analyzer.make_function_widget
+      autogenerate: true
+      display_name: Autogenerate Threshold
+    - command: napari-organelle-contact-analyzer.make_qwidget
+      display_name: Example QWidget
+    - command: napari-organelle-contact-analyzer.make_contact_analyzer
+      display_name: Organelle Contact Analyzer
+      autogenerate: false
+#   - command: napari-organelle-contact-analyzer.make_contact_filter
+#     display_name: Contact Filter
+
+
+# contributions:
+#   commands:
+#     - id: napari-organelle-contact-analyzer.get_reader
+#       python_name: napari_organelle_contact_analyzer._reader:napari_get_reader
+#       title: Open data with Napari Organelle Contact Analyzer
+
+#     - id: napari-organelle-contact-analyzer.write_results
+#       python_name: napari_organelle_contact_analyzer._writer:write_results
+#       title: Save analysis results
+
+#     - id: napari-organelle-contact-analyzer.make_sample_data
+#       python_name: napari_organelle_contact_analyzer._sample_data:make_sample_data
+#       title: Load sample organelle data
+
+#     - id: napari-organelle-contact-analyzer.organelle_analyzer_widget
+#       python_name: napari_organelle_contact_analyzer._widget:OrganelleContactAnalyzer
+#       title: Organelle Contact Analysis Widget
+
+#   readers:
+#     - command: napari-organelle-contact-analyzer.get_reader
+#       accepts_directories: false
+#       filename_patterns: ['*.npy', '*.tif', '*.tiff']
+
+#   writers:
+#     - command: napari-organelle-contact-analyzer.write_results
+#       layer_types: ['image', 'labels']
+#       filename_extensions: ['.npy', '.csv']
+
+#   sample_data:
+#     - command: napari-organelle-contact-analyzer.make_sample_data
+#       display_name: Sample Organelle Data
+#       key: organelle_sample_data
+
+#   widgets:
+#     - command: napari-organelle-contact-analyzer.organelle_analyzer_widget
+#       display_name: Organelle Contact Analyzer

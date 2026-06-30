@@ -1,7 +1,7 @@
 [project]
 name = "napari-organelle-contact-analyzer"
 dynamic = ["version"]
-description = "A plugin to analyze organelle contacts within the cell at a designated threshold distance."
+description = "A plugin to analyze signal contacts within the cell at a designated threshold distance."
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [
@@ -29,6 +29,11 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    "openpyxl",
+    "scipy",
+    "pandas",
+    "imageio",
+    "aicsimageio",
 ]
 
 [project.optional-dependencies]
@@ -63,10 +68,8 @@ where = ["src"]
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
 
-
 [tool.setuptools_scm]
 write_to = "src/napari_organelle_contact_analyzer/_version.py"
-
 
 [tool.black]
 line-length = 79
