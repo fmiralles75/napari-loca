@@ -9,6 +9,10 @@ categories: ["Annotation", "Segmentation", "Acquisition"]
 
 contributions:
   commands:
+    - id: napari-organelle-contact-analyzer.get_reader
+      python_name: napari_organelle_contact_analyzer._reader:napari_get_reader
+      title: Open data with Napari Organelle Contact Analyzer
+
     # Main widget only (cleaned dropdown)
     - id: napari-organelle-contact-analyzer.make_contact_analyzer
       python_name: napari_organelle_contact_analyzer._widget:OrganelleContactWidget
@@ -17,6 +21,11 @@ contributions:
     # - id: napari-organelle-contact-analyzer.make_contact_filter
     #   python_name: napari_organelle_contact_analyzer.widget:contact_filter_widget
     #   title: Make Contact Filter Widget
+
+  readers:
+    - command: napari-organelle-contact-analyzer.get_reader
+      accepts_directories: false
+      filename_patterns: ['*.tif', '*.tiff', '*.ome.tif', '*.ome.tiff', '*.nd2', '*.czi', '*.lif']
 
   widgets:
     - command: napari-organelle-contact-analyzer.make_contact_analyzer

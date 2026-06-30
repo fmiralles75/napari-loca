@@ -33,7 +33,18 @@ dependencies = [
     "scipy",
     "pandas",
     "imageio",
-    "aicsimageio",
+    # aicsimageio[nd2] adds Nikon .nd2 support; [base-imageio] adds common
+    # formats (PNG, GIF, etc.) via the imageio backend. TIFF/OME-TIFF work
+    # out of the box with bare aicsimageio.
+    "aicsimageio[nd2,base-imageio]",
+    # CZI (Zeiss) and LIF (Leica) support are GPL-licensed and deliberately
+    # excluded from aicsimageio's own "all" extra so it doesn't pull GPL
+    # code into non-GPL projects by default; aicsimageio's docs say to add
+    # them directly if you need them. Not legal advice -- if license
+    # compatibility matters for your distribution, worth a second look.
+    "aicspylibczi>=3.1.1",
+    "fsspec>=2022.8.0",
+    "readlif>=0.6.4",
     # tifffile 2025.2.18 removed the deprecated TIFF.RESUNIT enum that
     # aicsimageio's tiff reader still depends on, causing
     # AttributeError: '_TIFF' object has no attribute 'RESUNIT'.

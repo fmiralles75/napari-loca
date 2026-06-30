@@ -3,6 +3,7 @@ try:
 except ImportError:
     __version__ = "unknown"
 
+from ._reader import napari_get_reader
 from ._widget import OrganelleContactWidget
 
-__all__ = ("OrganelleContactWidget",)
+__all__ = ("napari_get_reader", "OrganelleContactWidget")
