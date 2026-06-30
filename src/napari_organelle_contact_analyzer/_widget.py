@@ -1,49 +1,20 @@
 """
-GPT Modification 61
------------------------------------
-Updated:
-- Fixed thresholded/contacts overlay Z-shift after signal-based Z restriction by preserving display Z translation.
+napari-organelle-contact-analyzer widget.
+
+Implements the main ``OrganelleContactWidget`` used to threshold organelle
+signal channels, compute contact/overlap metrics between them, and export
+results.
+
+Note: this module previously monkey-patched ``tifffile.RESUNIT`` and
+napari's ``_shapes_mouse_bindings.polygon_creating`` at import time to work
+around bugs in those libraries. Both patches were removed in favor of
+explicit version constraints in ``pyproject.toml``
+(``tifffile<2025.2.18`` and ``napari>=0.6.1``) — see the comments there for
+the upstream issues each constraint works around.
 """
 
 import copy
 import re
-
-# --- Patch tifffile to work around RESUNIT attribute error ---
-try:
-    import tifffile
-
-    if not hasattr(tifffile, "RESUNIT"):
-        tifffile.RESUNIT = {
-            "NONE": 1,
-            "MICROMETER": 1,
-            "MILLIMETER": 1e3,
-            "CENTIMETER": 1e4,
-            "INCH": 25400,
-        }
-except Exception:
-    pass
-
-# --- Patch napari's polygon_creating to avoid missing cursor position errors ---
-try:
-    from napari.layers.shapes import _shapes_mouse_bindings as smb
-
-    if not hasattr(smb, "_patched_polygon_creating"):
-        original_polygon_creating = smb.polygon_creating
-
-        def patched_polygon_creating(layer, event):
-            if layer._last_cursor_position is None:
-                try:
-                    import numpy as np
-
-                    layer._last_cursor_position = np.array(event.pos)
-                except Exception:
-                    layer._last_cursor_position = event.pos
-            return original_polygon_creating(layer, event)
-
-        smb.polygon_creating = patched_polygon_creating
-        smb._patched_polygon_creating = True
-except Exception as e:
-    print("Warning: Could not patch polygon_creating:", e)
 
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 
