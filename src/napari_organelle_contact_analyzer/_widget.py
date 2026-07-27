@@ -15,6 +15,7 @@ the upstream issues each constraint works around.
 
 import copy
 import re
+import warnings
 
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 
@@ -2529,8 +2530,30 @@ class OrganelleContactWidget(QWidget):
             def patched_get_value(*args, **kwargs):
                 try:
                     return original_get_value(*args, **kwargs)
-                except Exception:
-                    return None
+                except Exception as exc:
+                    # napari's Shapes._get_value contract is to return a
+                    # (shape_index, vertex_index) tuple. The mouse
+                    # binding that calls get_value immediately does
+                    # `shape_under_cursor, vertex_under_cursor = value`,
+                    # which raises TypeError if value is bare None.
+                    # Returning None here (as this used to) meant that
+                    # the first time get_value raised anything, the very
+                    # next click on the layer would crash silently
+                    # inside napari's mouse-event handling -- which is
+                    # indistinguishable, from the user's side, from
+                    # "I can no longer reselect my ROI." Returning
+                    # (None, None) keeps the contract so a single failed
+                    # hit-test only misses that one click instead of
+                    # looking like selection is broken.
+                    warnings.warn(
+                        "ROI layer get_value() raised "
+                        f"{exc!r}; treating this click as "
+                        "'no shape under cursor'. If this keeps "
+                        "happening, that's the real bug to chase down.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    return (None, None)
 
             roi_layer.get_value = patched_get_value
             roi_layer._patched_get_value = True
