@@ -2528,8 +2528,25 @@ class OrganelleContactWidget(QWidget):
             original_get_value = roi_layer.get_value
 
             def patched_get_value(*args, **kwargs):
+                # TEMPORARY DIAGNOSTIC LOGGING -- see PUBLISHING_ROADMAP.md
+                # note on ROI reselection. Prints on every call (not just
+                # on exception) so we can see what's actually happening
+                # the next time reselection fails, instead of guessing.
+                # Safe to remove once the underlying issue is found.
+                active = self.viewer.layers.selection.active
                 try:
-                    return original_get_value(*args, **kwargs)
+                    value = original_get_value(*args, **kwargs)
+                    print(
+                        "[ROI get_value]",
+                        "active_layer=", getattr(active, "name", None),
+                        "roi_mode=", roi_layer.mode,
+                        "roi_visible=", roi_layer.visible,
+                        "n_shapes=", len(roi_layer.data),
+                        "args=", args,
+                        "kwargs=", kwargs,
+                        "-> value=", value,
+                    )
+                    return value
                 except Exception as exc:
                     # napari's Shapes._get_value contract is to return a
                     # (shape_index, vertex_index) tuple. The mouse
