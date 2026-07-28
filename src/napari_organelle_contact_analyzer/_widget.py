@@ -2574,3 +2574,25 @@ class OrganelleContactWidget(QWidget):
 
             roi_layer.get_value = patched_get_value
             roi_layer._patched_get_value = True
+
+        if not hasattr(roi_layer, "_patched_mode_refresh"):
+            # From the diagnostic logging above: once a shape is
+            # finished being drawn (or an incomplete one gets deleted)
+            # and the layer's mode changes to "direct"/"select" --
+            # whether via this widget's button or napari's own layer
+            # control buttons -- get_value()'s shape hit-test
+            # (ShapeList.inside(), which checks cached per-slice
+            # bounding boxes / triangle meshes) stops finding the
+            # shape at all, even hovering dead-center over it. That
+            # smells like a stale slice-view cache that a mode change
+            # doesn't itself invalidate. Forcing layer.refresh() on
+            # every mode change re-triggers Shapes._set_view_slice()
+            # and should rebuild that cache. This is a workaround, not
+            # a confirmed root-cause fix -- report back whether
+            # reselection works now.
+            def _refresh_on_mode_change(event=None):
+                print("[ROI] mode changed -> forcing layer.refresh()")
+                roi_layer.refresh()
+
+            roi_layer.events.mode.connect(_refresh_on_mode_change)
+            roi_layer._patched_mode_refresh = True
