@@ -2549,18 +2549,7 @@ class OrganelleContactWidget(QWidget):
 
             def patched_get_value(*args, **kwargs):
                 try:
-                    value = original_get_value(*args, **kwargs)
-                    # TEMPORARY DIAGNOSTIC LOGGING: only print when a
-                    # shape is actually hit, or print every Nth call,
-                    # would both hide the failure case we care about --
-                    # print every call. Noisy on purpose; safe to
-                    # remove once reselection is confirmed fixed.
-                    print(
-                        "[ROI get_value] args=", args,
-                        "kwargs=", kwargs,
-                        "-> value=", value,
-                    )
-                    return value
+                    return original_get_value(*args, **kwargs)
                 except Exception as exc:
                     # napari's Shapes._get_value contract is to return a
                     # (shape_index, vertex_index) tuple. The mouse
@@ -2588,82 +2577,3 @@ class OrganelleContactWidget(QWidget):
 
             roi_layer.get_value = patched_get_value
             roi_layer._patched_get_value = True
-
-        if not hasattr(roi_layer, "_patched_mode_refresh"):
-            # Root cause (confirmed by reading napari's Shapes/ShapeList
-            # source, napari.layers.shapes._shape_list.ShapeList):
-            # `_visible_shapes` and `_bounding_boxes` -- what inside()
-            # uses for hit-testing clicks against shapes -- are
-            # @cached_property. ShapeList.add() clears that cache, but
-            # ShapeList.update()/edit() does not. When the polygon-lasso
-            # tool finishes drawing, _finish_drawing() converts the shape
-            # from an open "path" to a closed "polygon" via
-            # ShapeList.edit(..., new_type=Polygon), which calls
-            # update() -- not add() -- so the cache is never invalidated.
-            # If anything hit-tested the shape earlier in the drag (napari's
-            # own hover highlighting calls get_value() constantly), the
-            # cache locked in the shape's bounding box from partway through
-            # drawing (near zero-area, at the very first vertex) and never
-            # gets refreshed again -- so every later click misses,
-            # regardless of position. layer.refresh() doesn't help because
-            # it re-triggers _set_view_slice(), which only clears this
-            # cache when the slice actually changes.
-            #
-            # The one thing guaranteed to rebuild it correctly is
-            # reassigning `.data`: Shapes.data's setter builds a brand new
-            # ShapeList from scratch (see shapes.py's `@data.setter`),
-            # which has no stale cache. Doing this here (on mode change,
-            # after _finish_drawing() has already returned) avoids
-            # re-entering _finish_drawing() itself.
-            def _rebuild_roi_shape_cache(event=None):
-                # TEMPORARY DIAGNOSTIC LOGGING: confirms whether this
-                # handler runs and whether the data reassignment
-                # succeeds, since a silent exception here would
-                # otherwise just look identical to "the fix didn't
-                # work." Safe to remove once reselection is confirmed
-                # fixed.
-                print(
-                    "[ROI] mode ->", roi_layer.mode,
-                    "n_shapes=", len(roi_layer.data),
-                )
-                if len(roi_layer.data) > 0:
-                    try:
-                        roi_layer.data = roi_layer.data
-                        print("[ROI] rebuilt ShapeList via data = data")
-                    except Exception as exc:
-                        print(
-                            "[ROI] rebuilding ShapeList RAISED:",
-                            repr(exc),
-                        )
-                        raise
-
-                    # TEMPORARY DIAGNOSTIC: inspect what napari's own
-                    # hit-test would actually see right now -- does the
-                    # shape have a sane bounding box, and does it have
-                    # any triangles at all? A correct-looking bounding
-                    # box with zero triangles would point to a mesh
-                    # triangulation failure (can happen with
-                    # self-intersecting/complex lasso polygons) rather
-                    # than a caching problem.
-                    try:
-                        dv = roi_layer._data_view
-                        for i, shape in enumerate(dv.shapes):
-                            bbox = shape.bounding_box
-                            n_tri = len(shape._all_triangles())
-                            print(
-                                "[ROI] shape", i,
-                                "type=", type(shape).__name__,
-                                "bounding_box=", bbox,
-                                "n_triangles=", n_tri,
-                                "n_vertices=", len(shape.data),
-                            )
-                        print(
-                            "[ROI] visible_shapes indices=",
-                            [s[0] for s in dv._visible_shapes],
-                            "slice_key=", dv.slice_key,
-                        )
-                    except Exception as exc:
-                        print("[ROI] diagnostic inspection RAISED:", repr(exc))
-
-            roi_layer.events.mode.connect(_rebuild_roi_shape_cache)
-            roi_layer._patched_mode_refresh = True
