@@ -2585,8 +2585,26 @@ class OrganelleContactWidget(QWidget):
             # after _finish_drawing() has already returned) avoids
             # re-entering _finish_drawing() itself.
             def _rebuild_roi_shape_cache(event=None):
+                # TEMPORARY DIAGNOSTIC LOGGING: confirms whether this
+                # handler runs and whether the data reassignment
+                # succeeds, since a silent exception here would
+                # otherwise just look identical to "the fix didn't
+                # work." Safe to remove once reselection is confirmed
+                # fixed.
+                print(
+                    "[ROI] mode ->", roi_layer.mode,
+                    "n_shapes=", len(roi_layer.data),
+                )
                 if len(roi_layer.data) > 0:
-                    roi_layer.data = roi_layer.data
+                    try:
+                        roi_layer.data = roi_layer.data
+                        print("[ROI] rebuilt ShapeList via data = data")
+                    except Exception as exc:
+                        print(
+                            "[ROI] rebuilding ShapeList RAISED:",
+                            repr(exc),
+                        )
+                        raise
 
             roi_layer.events.mode.connect(_rebuild_roi_shape_cache)
             roi_layer._patched_mode_refresh = True
