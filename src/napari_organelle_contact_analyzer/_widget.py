@@ -2495,6 +2495,24 @@ class OrganelleContactWidget(QWidget):
             while data.ndim > 3:
                 data = data[0]
             roi_ndim = data.ndim
+
+            # Root cause of the ROI-reselection bug: napari rounds each
+            # shape's own slice position to the nearest integer
+            # (PolygonBase.data setter: `np.rint(bounding_box).astype(int)`)
+            # but compares it against the *layer's* current slice
+            # position, which is a world-coordinate float. If the ROI
+            # layer's scale doesn't match the base image's scale, that
+            # float is only an integer by coincidence -- e.g. an image
+            # with Z-scale 0.55 puts you at world Z=1.65 on slice 3,
+            # and an ROI layer with default scale=1 sees that as data
+            # Z=1.65, which never equals its own rounded slice_key. The
+            # shape then silently drops out of every hit-test, forever,
+            # on every slice. Matching scale/translate to the base
+            # image makes the ROI layer's slice math land on the same
+            # integers the base image uses, so it stays selectable.
+            base_scale = np.asarray(base_layer.scale)[-roi_ndim:]
+            base_translate = np.asarray(base_layer.translate)[-roi_ndim:]
+
             roi_layer = self.viewer.add_shapes(
                 name="ROI",
                 shape_type="polygon",
@@ -2502,6 +2520,8 @@ class OrganelleContactWidget(QWidget):
                 face_color="transparent",
                 opacity=0.5,
                 ndim=roi_ndim,
+                scale=base_scale,
+                translate=base_translate,
             )
             roi_layer.data = []
             roi_layer.mode = "select"
