@@ -47,6 +47,8 @@ def napari_get_reader(path: Union[str, List[str]]):
         path = path[0]
 
     if _is_nd2_path(path):
+        # TEMPORARY DIAGNOSTIC: see matching note in _read_nd2().
+        print("=== napari-organelle-contact-analyzer: napari_get_reader() probing", path, "===")
         try:
             import nd2
         except ImportError:
@@ -125,9 +127,29 @@ def _read_nd2(path: str):
     """
     import nd2
 
+    # TEMPORARY DIAGNOSTIC: three fixes in a row haven't stopped the
+    # warning, which raises the question of whether this function is
+    # even the code path being run for .nd2 files, versus some other
+    # installed plugin/reader also handling them. This print is
+    # deliberately impossible to miss in the terminal output -- if it
+    # does NOT appear right before the warning, that confirms this
+    # code isn't the source and the search needs to go elsewhere.
+    # Safe to remove once that's settled.
+    print("=== napari-organelle-contact-analyzer: _read_nd2() called for", path, "===")
+
     with nd2.ND2File(path) as f:
         data = np.asarray(f.asarray())
         native_order = list(f.sizes.keys())  # e.g. ['T', 'C', 'Z', 'Y', 'X']
+        print(
+            "=== napari-organelle-contact-analyzer: nd2.ND2File closed?",
+            f.closed,
+            "(should be False here, inside the `with` block) ===",
+        )
+
+    print(
+        "=== napari-organelle-contact-analyzer: after `with` block, "
+        "file should now be closed ==="
+    )
 
     # Reorder nd2's native axes to match whichever of "CZYX" / "ZYX" /
     # "YX" the file actually has all of -- the same cascade the
