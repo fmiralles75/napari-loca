@@ -1664,16 +1664,30 @@ class OrganelleContactWidget(QWidget):
             for idx, poly in enumerate(roi_polys):
                 poly_data = np.array(poly, dtype=float)
 
-                # No world<->data conversion needed here: the ROI layer
-                # is created (in toggle_roi_selection) with scale/translate
-                # copied directly from base_layer's trailing (Y, X) axes,
-                # so roi_layer.data is already expressed in base_layer's
-                # own pixel-index coordinates. This used to be necessary
-                # because the ROI layer defaulted to scale=1, making its
-                # stored data equal to world coordinates -- that's no
-                # longer the case, and re-applying this conversion now
-                # would silently shift ROI masks on any image with
-                # non-unit scale.
+                if len(base_layer.scale) >= 3 and not np.allclose(
+                    base_layer.scale[1:3], (1, 1)
+                ):
+                    if poly_data.shape[1] >= 3:
+                        poly_data_converted = np.empty_like(poly_data)
+                        poly_data_converted[:, 0] = (
+                            poly_data[:, 0] - base_layer.translate[0]
+                        ) / base_layer.scale[0]
+                        poly_data_converted[:, 1] = (
+                            poly_data[:, 1] - base_layer.translate[1]
+                        ) / base_layer.scale[1]
+                        poly_data_converted[:, 2] = (
+                            poly_data[:, 2] - base_layer.translate[2]
+                        ) / base_layer.scale[2]
+                        poly_data = poly_data_converted
+                    elif poly_data.shape[1] == 2:
+                        poly_data_converted = np.empty_like(poly_data)
+                        poly_data_converted[:, 0] = (
+                            poly_data[:, 0] - base_layer.translate[0]
+                        ) / base_layer.scale[0]
+                        poly_data_converted[:, 1] = (
+                            poly_data[:, 1] - base_layer.translate[1]
+                        ) / base_layer.scale[1]
+                        poly_data = poly_data_converted
 
                 if poly_data.shape[1] > 2:
                     poly_data[:, 1] = np.clip(
@@ -1685,24 +1699,14 @@ class OrganelleContactWidget(QWidget):
                     rows = poly_data[:, 1]
                     cols = poly_data[:, 2]
                 else:
-                    # 2D roi polygon data is (row, col) = (Y, X), the
-                    # same axis order as the trailing two columns in
-                    # the >2 branch above (which is (Z, Y, X)) -- not
-                    # (X, Y). This branch was effectively dead code
-                    # before ROI layers were made 2D-only (see
-                    # toggle_roi_selection), since roi_ndim used to
-                    # always match the base image's 3 axes; fixed here
-                    # to match that convention instead of the
-                    # transposed one it previously had, since it's now
-                    # the only path ROI masks take.
                     poly_data[:, 0] = np.clip(
-                        poly_data[:, 0], 0, ref_xy[0] - 1
+                        poly_data[:, 0], 0, ref_xy[1] - 1
                     )
                     poly_data[:, 1] = np.clip(
-                        poly_data[:, 1], 0, ref_xy[1] - 1
+                        poly_data[:, 1], 0, ref_xy[0] - 1
                     )
-                    rows = poly_data[:, 0]
-                    cols = poly_data[:, 1]
+                    rows = poly_data[:, 1]
+                    cols = poly_data[:, 0]
 
                 rr, cc = polygon(rows, cols, shape=ref_xy)
                 roi_mask_2d = np.zeros(ref_xy, dtype=bool)
@@ -1869,10 +1873,8 @@ class OrganelleContactWidget(QWidget):
                 cols = roi_poly_data[:, 2]
                 rows = roi_poly_data[:, 1]
             else:
-                # (row, col) = (Y, X), matching the convention used
-                # for mask rasterization above.
-                rows = roi_poly_data[:, 0]
-                cols = roi_poly_data[:, 1]
+                cols = roi_poly_data[:, 0]
+                rows = roi_poly_data[:, 1]
             pts2d = np.column_stack((cols, rows))
             ellipse_circ, poly_perim, circ_ratio = compute_additional_metrics(
                 geom[0], geom[1], pts2d
@@ -2489,33 +2491,25 @@ class OrganelleContactWidget(QWidget):
                 if layers
                 else self.viewer.layers[0]
             )
-            # The ROI layer is deliberately created 2D (Y, X only), not
-            # matching the base image's full ndim. napari shows a
-            # lower-dimensional Shapes layer on *every* slice of a
-            # higher-dimensional viewer, because a shape with no data
-            # along an axis has nothing to slice-filter against --
-            # see ShapeList._visible_shapes: when the layer's own
-            # slice_key is empty, every shape is considered visible
-            # regardless of which Z-slice you're on. That's what makes
-            # ROIs drawn on one slice stay visible and selectable on
-            # every other slice too.
-            #
-            # This is safe for the analysis below: compute_roi_geometry()
-            # and the per-ROI mask builder already have working 2D
-            # branches (poly_data.shape[1] == 2) alongside their 3D
-            # ones, and the mask builder already tiles a 2D ROI mask
-            # across every Z-plane for 3D images (np.tile(roi_mask_2d,
-            # (masks[0].shape[0], 1, 1))) -- so a 2D-only ROI was
-            # already the shape the analysis expected to apply
-            # uniformly across the stack; only the drawing layer itself
-            # was unnecessarily 3D.
-            #
-            # (Still rounds through PolygonBase.data's
-            # `np.rint(bounding_box).astype(int)` per-shape slice_key
-            # logic that caused the original reselection bug, but with
-            # no non-displayed axes left to round, that logic never
-            # runs against a mismatched value.)
-            roi_ndim = 2
+            data = np.asarray(base_layer.data)
+            while data.ndim > 3:
+                data = data[0]
+            roi_ndim = data.ndim
+
+            # Root cause of the ROI-reselection bug: napari rounds each
+            # shape's own slice position to the nearest integer
+            # (PolygonBase.data setter: `np.rint(bounding_box).astype(int)`)
+            # but compares it against the *layer's* current slice
+            # position, which is a world-coordinate float. If the ROI
+            # layer's scale doesn't match the base image's scale, that
+            # float is only an integer by coincidence -- e.g. an image
+            # with Z-scale 0.55 puts you at world Z=1.65 on slice 3,
+            # and an ROI layer with default scale=1 sees that as data
+            # Z=1.65, which never equals its own rounded slice_key. The
+            # shape then silently drops out of every hit-test, forever,
+            # on every slice. Matching scale/translate to the base
+            # image makes the ROI layer's slice math land on the same
+            # integers the base image uses, so it stays selectable.
             base_scale = np.asarray(base_layer.scale)[-roi_ndim:]
             base_translate = np.asarray(base_layer.translate)[-roi_ndim:]
 
@@ -2532,8 +2526,9 @@ class OrganelleContactWidget(QWidget):
             roi_layer.data = []
             roi_layer.mode = "select"
             print(
-                "ROI layer created (2D, visible on every slice)."
-                " Use the layer controls to add ROI(s).",
+                "ROI layer created with ndim =",
+                roi_ndim,
+                ". Use the layer controls to add ROI(s).",
             )
         else:
             if len(list(roi_layer.data)) == 0:
