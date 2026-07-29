@@ -6,7 +6,8 @@ microscopy images. With the dependencies declared in ``pyproject.toml``,
 this supports:
 
 - TIFF / OME-TIFF (bundled with aicsimageio)
-- Nikon ND2 (via the ``aicsimageio[nd2]`` extra)
+- Nikon ND2 (via the ``nd2`` package, used directly -- see ``_read_nd2``
+  below for why this bypasses aicsimageio specifically for this format)
 - Zeiss CZI (via ``aicspylibczi``, GPL-licensed, installed separately
   per aicsimageio's own docs since it can't be bundled into an MPL/BSD
   package's default extras)
@@ -19,6 +20,10 @@ formats aicsimageio can be extended to support.
 from typing import Any, Dict, List, Union
 
 import numpy as np
+
+
+def _is_nd2_path(path: str) -> bool:
+    return str(path).lower().endswith(".nd2")
 
 
 def napari_get_reader(path: Union[str, List[str]]):
@@ -34,17 +39,29 @@ def napari_get_reader(path: Union[str, List[str]]):
     Returns
     -------
     function or None
-        If aicsimageio can open the path, a function that reads it and
+        If the file can actually be read, a function that reads it and
         returns napari layer data. Otherwise None, so napari can fall back
         to another reader.
     """
+    if isinstance(path, list):
+        path = path[0]
+
+    if _is_nd2_path(path):
+        try:
+            import nd2
+        except ImportError:
+            return None
+        try:
+            with nd2.ND2File(path):
+                pass
+        except Exception:
+            return None
+        return reader_function
+
     try:
         from aicsimageio import AICSImage
     except ImportError:
         return None
-
-    if isinstance(path, list):
-        path = path[0]
 
     # Probe-open the file to confirm aicsimageio can actually read it
     # before committing to this reader.
@@ -64,7 +81,7 @@ def napari_get_reader(path: Union[str, List[str]]):
 
 
 def reader_function(path: Union[str, List[str]]):
-    """Read image data from ``path`` using aicsimageio.
+    """Read image data from ``path``.
 
     Parameters
     ----------
@@ -78,42 +95,81 @@ def reader_function(path: Union[str, List[str]]):
         A single-element list of (data, add_kwargs, layer_type) tuples,
         per the napari reader contract.
     """
-    from aicsimageio import AICSImage
-
     if isinstance(path, list):
         path = path[0]
+
+    if _is_nd2_path(path):
+        return _read_nd2(path)
+    return _read_with_aicsimageio(path)
+
+
+def _read_nd2(path: str):
+    """Read an ND2 file with the ``nd2`` package directly.
+
+    Deliberately bypasses aicsimageio for this one format. Two earlier
+    attempts to fix the "ND2File file not closed before garbage
+    collection" warning by working around aicsimageio's internal
+    caching (avoiding ``img.dims``, then pre-warming
+    ``Reader.xarray_data`` before aicsimageio's own mosaic-tile check
+    could force a delayed read) both turned out to be incomplete --
+    aicsimageio's ND2 support goes through several layers of internal
+    caching, an unconditional mosaic-tile check, and (for the delayed
+    path) nd2's own dask wrapping via ``ResourceBackedDaskArray``,
+    and the exact combination that leaves a ``nd2.ND2File`` handle
+    open long enough to be garbage-collected wasn't fully pinned down
+    even after reading through aicsimageio's and nd2's source directly.
+    Reading here with one explicit, fully eager ``with nd2.ND2File(...)``
+    block -- no dask, no delayed xarray, no aicsimageio in the loop at
+    all -- removes that uncertainty rather than continuing to guess at
+    aicsimageio's internals.
+    """
+    import nd2
+
+    with nd2.ND2File(path) as f:
+        data = np.asarray(f.asarray())
+        native_order = list(f.sizes.keys())  # e.g. ['T', 'C', 'Z', 'Y', 'X']
+
+    # Reorder nd2's native axes to match whichever of "CZYX" / "ZYX" /
+    # "YX" the file actually has all of -- the same cascade the
+    # aicsimageio-based path used -- so downstream code (channel
+    # splitting, the ndim>3 squeezes elsewhere in this plugin) sees a
+    # consistent axis layout regardless of which reader produced the
+    # array. Any other axes nd2 reports (T, P/position, etc.) are
+    # moved to the front, to be dropped by the same "ndim > 4" squeeze
+    # used for every other format below.
+    target = None
+    for candidate in ("CZYX", "ZYX", "YX"):
+        if all(letter in native_order for letter in candidate):
+            target = list(candidate)
+            break
+    if target is None:
+        target = [d for d in native_order if d in "CZYX"]
+
+    extras = [d for d in native_order if d not in target]
+    order = extras + target
+    data = np.transpose(data, [native_order.index(d) for d in order])
+    dims_used = "".join(order)
+
+    while data.ndim > 4:
+        data = data[0]
+
+    add_kwargs: Dict[str, Any] = {
+        "metadata": {
+            "reader": "nd2",
+            "filename": path,
+            "aics_dims": f"{dims_used}{data.shape}",
+        }
+    }
+    return [(data, add_kwargs, "image")]
+
+
+def _read_with_aicsimageio(path: str):
+    """Read a non-ND2 image with aicsimageio."""
+    from aicsimageio import AICSImage
 
     img = None
     try:
         img = AICSImage(path)
-
-        # Avoiding img.dims wasn't enough on its own (see prior fix):
-        # AICSImage.xarray_data -- which get_image_data() below calls
-        # into regardless -- unconditionally checks for mosaic tiles
-        # before it does anything else, via
-        # `DimensionNames.MosaicTile in self.reader.dims.order`. That
-        # touches the *reader's own* `dims` property, which (if nothing
-        # has populated it yet) forces Reader.xarray_dask_data ->
-        # Reader._read_delayed(). For ND2 specifically, the delayed
-        # dask array that produces depends on its own nd2.ND2File
-        # staying open for later chunk reads -- a documented upstream
-        # design choice in the nd2 package (tlambert03/nd2#19) -- and
-        # that handle is never explicitly closed by anyone, which is
-        # what was producing the "ND2File not closed before garbage
-        # collection" warning even after removing our own img.dims use.
-        #
-        # Reader.xarray_data (the reader's *immediate*, non-delayed
-        # property -- for ND2 this opens nd2.ND2File in a single `with`
-        # block and closes it right away) has a side effect of also
-        # caching a safe, already-in-memory-backed placeholder for
-        # Reader.xarray_dask_data. Forcing that here, before touching
-        # anything on the AICSImage wrapper, means the mosaic check
-        # above finds that placeholder already cached instead of
-        # triggering a real delayed nd2 read -- so the leaky path never
-        # gets taken in the first place. No data is read twice: once
-        # cached, AICSImage.xarray_data's own (non-mosaic) codepath
-        # reuses this same object.
-        img.reader.xarray_data
 
         dims_used = "CZYX"
         try:

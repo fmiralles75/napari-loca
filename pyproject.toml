@@ -33,10 +33,18 @@ dependencies = [
     "scipy",
     "pandas",
     "imageio",
-    # aicsimageio[nd2] adds Nikon .nd2 support; [base-imageio] adds common
-    # formats (PNG, GIF, etc.) via the imageio backend. TIFF/OME-TIFF work
-    # out of the box with bare aicsimageio.
-    "aicsimageio[nd2,base-imageio]",
+    # [base-imageio] adds common formats (PNG, GIF, etc.) via the imageio
+    # backend. TIFF/OME-TIFF work out of the box with bare aicsimageio.
+    "aicsimageio[base-imageio]",
+    # ND2 (Nikon) files are read directly with the nd2 package in
+    # _reader.py, bypassing aicsimageio's own ND2 support entirely --
+    # see _read_nd2()'s docstring for why (a "ND2File file not closed
+    # before garbage collection" warning traced back to aicsimageio's
+    # internal delayed/dask/mosaic-check handling of nd2 files, not to
+    # our own file-closing code). Declared directly rather than via
+    # aicsimageio's [nd2] extra since aicsimageio itself is no longer
+    # used to read these files at all.
+    "nd2>=0.7.0",
     # CZI (Zeiss) and LIF (Leica) support are GPL-licensed and deliberately
     # excluded from aicsimageio's own "all" extra so it doesn't pull GPL
     # code into non-GPL projects by default; aicsimageio's docs say to add
