@@ -2529,7 +2529,18 @@ class OrganelleContactWidget(QWidget):
 
             def patched_get_value(*args, **kwargs):
                 try:
-                    return original_get_value(*args, **kwargs)
+                    value = original_get_value(*args, **kwargs)
+                    # TEMPORARY DIAGNOSTIC LOGGING: only print when a
+                    # shape is actually hit, or print every Nth call,
+                    # would both hide the failure case we care about --
+                    # print every call. Noisy on purpose; safe to
+                    # remove once reselection is confirmed fixed.
+                    print(
+                        "[ROI get_value] args=", args,
+                        "kwargs=", kwargs,
+                        "-> value=", value,
+                    )
+                    return value
                 except Exception as exc:
                     # napari's Shapes._get_value contract is to return a
                     # (shape_index, vertex_index) tuple. The mouse
@@ -2605,6 +2616,34 @@ class OrganelleContactWidget(QWidget):
                             repr(exc),
                         )
                         raise
+
+                    # TEMPORARY DIAGNOSTIC: inspect what napari's own
+                    # hit-test would actually see right now -- does the
+                    # shape have a sane bounding box, and does it have
+                    # any triangles at all? A correct-looking bounding
+                    # box with zero triangles would point to a mesh
+                    # triangulation failure (can happen with
+                    # self-intersecting/complex lasso polygons) rather
+                    # than a caching problem.
+                    try:
+                        dv = roi_layer._data_view
+                        for i, shape in enumerate(dv.shapes):
+                            bbox = shape.bounding_box
+                            n_tri = len(shape._all_triangles())
+                            print(
+                                "[ROI] shape", i,
+                                "type=", type(shape).__name__,
+                                "bounding_box=", bbox,
+                                "n_triangles=", n_tri,
+                                "n_vertices=", len(shape.data),
+                            )
+                        print(
+                            "[ROI] visible_shapes indices=",
+                            [s[0] for s in dv._visible_shapes],
+                            "slice_key=", dv.slice_key,
+                        )
+                    except Exception as exc:
+                        print("[ROI] diagnostic inspection RAISED:", repr(exc))
 
             roi_layer.events.mode.connect(_rebuild_roi_shape_cache)
             roi_layer._patched_mode_refresh = True
