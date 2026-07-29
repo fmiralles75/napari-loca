@@ -2523,6 +2523,7 @@ class OrganelleContactWidget(QWidget):
                 name="ROI",
                 shape_type="polygon",
                 edge_color="red",
+                edge_width=3,  # napari's Shapes default is 1; +2 for visibility
                 face_color="transparent",
                 opacity=0.5,
                 ndim=roi_ndim,
