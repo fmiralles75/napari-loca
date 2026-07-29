@@ -87,20 +87,34 @@ def reader_function(path: Union[str, List[str]]):
     try:
         img = AICSImage(path)
 
-        # get_image_data() uses aicsimageio's "immediate" read path
-        # (Reader.xarray_data -> Reader._read_immediate()), which for
-        # ND2 files opens the underlying nd2.ND2File in a single `with`
-        # block and closes it right away. Deliberately never touching
-        # `img.dims` (or `.dask_data` / `.xarray_dask_data`, etc.):
-        # those force aicsimageio's "delayed" dask path instead, and
-        # for ND2 files that hands back a dask array that keeps its
-        # own separate nd2.ND2File handle open for later chunk reads --
-        # by design, per a known upstream issue in the nd2 package
-        # (tlambert03/nd2#19: dask compute depends on the file staying
-        # open). That handle is never explicitly closed by anyone and
-        # is what was producing the "ND2File not closed before garbage
-        # collection" warning, regardless of how carefully img.close()
-        # is called on the top-level AICSImage object below.
+        # Avoiding img.dims wasn't enough on its own (see prior fix):
+        # AICSImage.xarray_data -- which get_image_data() below calls
+        # into regardless -- unconditionally checks for mosaic tiles
+        # before it does anything else, via
+        # `DimensionNames.MosaicTile in self.reader.dims.order`. That
+        # touches the *reader's own* `dims` property, which (if nothing
+        # has populated it yet) forces Reader.xarray_dask_data ->
+        # Reader._read_delayed(). For ND2 specifically, the delayed
+        # dask array that produces depends on its own nd2.ND2File
+        # staying open for later chunk reads -- a documented upstream
+        # design choice in the nd2 package (tlambert03/nd2#19) -- and
+        # that handle is never explicitly closed by anyone, which is
+        # what was producing the "ND2File not closed before garbage
+        # collection" warning even after removing our own img.dims use.
+        #
+        # Reader.xarray_data (the reader's *immediate*, non-delayed
+        # property -- for ND2 this opens nd2.ND2File in a single `with`
+        # block and closes it right away) has a side effect of also
+        # caching a safe, already-in-memory-backed placeholder for
+        # Reader.xarray_dask_data. Forcing that here, before touching
+        # anything on the AICSImage wrapper, means the mosaic check
+        # above finds that placeholder already cached instead of
+        # triggering a real delayed nd2 read -- so the leaky path never
+        # gets taken in the first place. No data is read twice: once
+        # cached, AICSImage.xarray_data's own (non-mosaic) codepath
+        # reuses this same object.
+        img.reader.xarray_data
+
         dims_used = "CZYX"
         try:
             data = img.get_image_data(dims_used)
