@@ -2528,25 +2528,8 @@ class OrganelleContactWidget(QWidget):
             original_get_value = roi_layer.get_value
 
             def patched_get_value(*args, **kwargs):
-                # TEMPORARY DIAGNOSTIC LOGGING -- see PUBLISHING_ROADMAP.md
-                # note on ROI reselection. Prints on every call (not just
-                # on exception) so we can see what's actually happening
-                # the next time reselection fails, instead of guessing.
-                # Safe to remove once the underlying issue is found.
-                active = self.viewer.layers.selection.active
                 try:
-                    value = original_get_value(*args, **kwargs)
-                    print(
-                        "[ROI get_value]",
-                        "active_layer=", getattr(active, "name", None),
-                        "roi_mode=", roi_layer.mode,
-                        "roi_visible=", roi_layer.visible,
-                        "n_shapes=", len(roi_layer.data),
-                        "args=", args,
-                        "kwargs=", kwargs,
-                        "-> value=", value,
-                    )
-                    return value
+                    return original_get_value(*args, **kwargs)
                 except Exception as exc:
                     # napari's Shapes._get_value contract is to return a
                     # (shape_index, vertex_index) tuple. The mouse
@@ -2576,23 +2559,34 @@ class OrganelleContactWidget(QWidget):
             roi_layer._patched_get_value = True
 
         if not hasattr(roi_layer, "_patched_mode_refresh"):
-            # From the diagnostic logging above: once a shape is
-            # finished being drawn (or an incomplete one gets deleted)
-            # and the layer's mode changes to "direct"/"select" --
-            # whether via this widget's button or napari's own layer
-            # control buttons -- get_value()'s shape hit-test
-            # (ShapeList.inside(), which checks cached per-slice
-            # bounding boxes / triangle meshes) stops finding the
-            # shape at all, even hovering dead-center over it. That
-            # smells like a stale slice-view cache that a mode change
-            # doesn't itself invalidate. Forcing layer.refresh() on
-            # every mode change re-triggers Shapes._set_view_slice()
-            # and should rebuild that cache. This is a workaround, not
-            # a confirmed root-cause fix -- report back whether
-            # reselection works now.
-            def _refresh_on_mode_change(event=None):
-                print("[ROI] mode changed -> forcing layer.refresh()")
-                roi_layer.refresh()
+            # Root cause (confirmed by reading napari's Shapes/ShapeList
+            # source, napari.layers.shapes._shape_list.ShapeList):
+            # `_visible_shapes` and `_bounding_boxes` -- what inside()
+            # uses for hit-testing clicks against shapes -- are
+            # @cached_property. ShapeList.add() clears that cache, but
+            # ShapeList.update()/edit() does not. When the polygon-lasso
+            # tool finishes drawing, _finish_drawing() converts the shape
+            # from an open "path" to a closed "polygon" via
+            # ShapeList.edit(..., new_type=Polygon), which calls
+            # update() -- not add() -- so the cache is never invalidated.
+            # If anything hit-tested the shape earlier in the drag (napari's
+            # own hover highlighting calls get_value() constantly), the
+            # cache locked in the shape's bounding box from partway through
+            # drawing (near zero-area, at the very first vertex) and never
+            # gets refreshed again -- so every later click misses,
+            # regardless of position. layer.refresh() doesn't help because
+            # it re-triggers _set_view_slice(), which only clears this
+            # cache when the slice actually changes.
+            #
+            # The one thing guaranteed to rebuild it correctly is
+            # reassigning `.data`: Shapes.data's setter builds a brand new
+            # ShapeList from scratch (see shapes.py's `@data.setter`),
+            # which has no stale cache. Doing this here (on mode change,
+            # after _finish_drawing() has already returned) avoids
+            # re-entering _finish_drawing() itself.
+            def _rebuild_roi_shape_cache(event=None):
+                if len(roi_layer.data) > 0:
+                    roi_layer.data = roi_layer.data
 
-            roi_layer.events.mode.connect(_refresh_on_mode_change)
+            roi_layer.events.mode.connect(_rebuild_roi_shape_cache)
             roi_layer._patched_mode_refresh = True
