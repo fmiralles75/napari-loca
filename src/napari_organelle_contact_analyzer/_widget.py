@@ -75,7 +75,11 @@ AUTO_METHODS = {
 # -----------------------------
 # Helpers
 # -----------------------------
-def compute_contact_density(contacts: np.ndarray, union_signal: np.ndarray):
+def compute_contact_density(contacts: np.ndarray, union_mask: np.ndarray):
+    """``union_mask`` should be the same union-of-all-channel-masks used
+    for the "Union" core overlap metric -- passed in directly rather than
+    recomputed here, so this and "Union" always agree and there's only
+    one place that mask gets built."""
     coords = np.column_stack(np.where(contacts))
     if coords.shape[0] < 2:
         avg_dist = np.nan
@@ -85,7 +89,7 @@ def compute_contact_density(contacts: np.ndarray, union_signal: np.ndarray):
         tree = KDTree(coords)
         dists, _ = tree.query(coords, k=2)
         avg_dist = np.mean(dists[:, 1])
-    cell_area = np.sum(union_signal)
+    cell_area = np.sum(union_mask)
     density_ratio = avg_dist / cell_area if cell_area > 0 else np.nan
     return avg_dist, cell_area, density_ratio
 
@@ -1775,10 +1779,6 @@ class OrganelleContactWidget(QWidget):
 
         self.last_masks = masks
 
-        union_signal = masks[0].copy()
-        for m in masks[1:]:
-            union_signal |= m
-
         contacts = np.zeros_like(masks[0], dtype=bool)
         for i in range(n):
             others = None
@@ -1866,16 +1866,12 @@ class OrganelleContactWidget(QWidget):
                 roi_area = int(np.sum(roi_mask))
 
                 restricted_masks = [m & roi_mask for m in masks]
-                restricted_union = restricted_masks[0].copy()
-                for m in restricted_masks[1:]:
-                    restricted_union |= m
                 restricted_contacts = contacts & roi_mask
 
                 metrics = self._compute_metrics_bundle(
                     raw_signals=raw_signals,
                     masks=restricted_masks,
                     contacts=restricted_contacts,
-                    union_signal=restricted_union,
                     ch_labels=ch_labels,
                     roi_poly_data=poly_data,
                     roi_area=roi_area,
@@ -1896,7 +1892,6 @@ class OrganelleContactWidget(QWidget):
                 raw_signals=raw_signals,
                 masks=masks,
                 contacts=contacts,
-                union_signal=union_signal,
                 ch_labels=ch_labels,
                 roi_poly_data=None,
                 roi_area=roi_area_full,
@@ -1945,7 +1940,6 @@ class OrganelleContactWidget(QWidget):
         raw_signals: List[np.ndarray],
         masks: List[np.ndarray],
         contacts: np.ndarray,
-        union_signal: np.ndarray,
         ch_labels: List[str],
         roi_poly_data: Optional[np.ndarray],
         roi_area: Optional[int],
@@ -2075,12 +2069,20 @@ class OrganelleContactWidget(QWidget):
             out["Circumference/Perimeter Ratio"] = float(circ_ratio)
 
         if self.output_selection.get("Contact Spatial", True):
+            # Reuses "union" (already computed above for the "Union"
+            # core overlap metric) instead of a separately-passed-in
+            # union mask -- these used to be computed twice from the
+            # same masks and reported under two different names
+            # ("Union" and "Union Signal Area"); now there's only one
+            # union area, and this ratio's name spells out what it
+            # actually divides.
             avg_dist, cell_area, density_ratio = compute_contact_density(
-                contacts, union_signal
+                contacts, union
             )
             out["Avg Contact Dist"] = float(avg_dist)
-            out["Union Signal Area"] = int(cell_area)
-            out["Contact Density Ratio"] = float(density_ratio)
+            out["Avg Contact Dist / Union Signal Area"] = float(
+                density_ratio
+            )
 
         if self.enable_intensity_comparisons:
             for comp in self.intensity_comparisons or []:
