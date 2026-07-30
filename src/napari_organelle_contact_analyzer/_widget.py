@@ -14,6 +14,7 @@ the upstream issues each constraint works around.
 """
 
 import copy
+import json
 import re
 import warnings
 
@@ -23,7 +24,7 @@ import napari
 from magicgui import magic_factory
 from magicgui.widgets import Container, create_widget
 from qtpy.QtGui import QIntValidator
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QSettings
 from qtpy.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
@@ -47,6 +48,7 @@ from qtpy.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QSizePolicy,
+    QTextEdit,
 )
 
 from skimage import filters
@@ -70,6 +72,17 @@ AUTO_METHODS = {
     "Yen": filters.threshold_yen,
     "Isodata": filters.threshold_isodata,
 }
+
+# Cross-session persistence (see OrganelleContactWidget._save_settings /
+# _load_settings). Stored as one JSON blob under a single QSettings key
+# rather than many individual QSettings keys, since QSettings' own
+# type handling (particularly for bools) is inconsistent across
+# platforms/backends -- JSON gives an exact, portable round-trip
+# instead.
+SETTINGS_ORG = "napari-organelle-contact-analyzer"
+SETTINGS_APP = "OrganelleContactWidget"
+SETTINGS_KEY = "widget_state_json"
+SETTINGS_SCHEMA_VERSION = 1
 
 
 # -----------------------------
@@ -179,6 +192,99 @@ def channels_to_text(channels_0_based: List[int]) -> str:
     chans = [int(c) for c in channels_0_based]
     chans = [c for c in chans if c >= 0]
     return ",".join(str(c + 1) for c in chans)
+
+
+# Kept in one place, and in the same grouping as the Output Selection
+# dialog, so this stays easy to keep in sync as metrics are added,
+# renamed, or removed.
+METRIC_GLOSSARY_HTML = """
+<h3>Core Overlap Metrics</h3>
+<p><b>Intersection</b> &mdash; pixel count where all channels are
+simultaneously thresholded-positive (logical AND across channels).</p>
+<p><b>Union</b> &mdash; pixel count where at least one channel is
+thresholded-positive (logical OR across channels).</p>
+<p><b>Intersection/Union (Contact Coefficient)</b> &mdash; the Jaccard
+index of the two above, a normalized 0-1 overlap score.</p>
+<p><b>Contact Area</b> &mdash; pixel count where a channel's signal sits
+within the Contact Threshold distance of every other channel's signal
+(a distance-tolerant version of intersection, not a strict AND).</p>
+
+<h3>Per-Channel Area Metrics</h3>
+<p><b>Signal Area (per channel)</b> &mdash; pixel count of that
+channel's thresholded signal alone.</p>
+<p><b>Intersection/Ch Signal Area (per channel)</b> &mdash; what
+fraction of that channel's own signal area falls inside the full
+intersection.</p>
+<p><b>Body Count (per channel)</b> &mdash; number of separate connected
+components ("bodies") in the channel's thresholded mask.</p>
+<p><b>Average Area per Body (per channel)</b> &mdash; the average size
+of those connected components (Signal Area / Body Count).</p>
+<p><b>Fragmentation Coefficient (per channel)</b> &mdash; Average Area
+per Body divided by Signal Area (equivalent to 1/Body Count). Near 1
+means the channel's signal is essentially one contiguous body; near 0
+means it's spread across many bodies.</p>
+
+<h3>Per-ROI Area Metrics</h3>
+<p><b>ROI Area</b> &mdash; pixel count of the ROI (or the full image,
+when not using per-ROI analysis).</p>
+<p><b>Signal Area/ROI Area (per channel)</b> &mdash; that channel's
+signal area as a fraction of the ROI/image.</p>
+
+<h3>Intensity Metrics</h3>
+<p><b>Mean Intensity (per channel)</b> &mdash; average raw intensity
+within that channel's own thresholded mask.</p>
+<p><b>Contact Mean Intensity (per channel)</b> &mdash; average raw
+intensity within the Contact Area region.</p>
+<p><b>Signal Intensity Comparisons</b> &mdash; your own configured
+comparisons (mean intensity of a source channel within a
+Union/Intersection/Contacts region, optionally minus another region).
+Off by default; only appears if you've set one up via Output
+Selection.</p>
+
+<h3>Advanced ROI/Spatial Metrics</h3>
+<p><b>Max Distance</b> &mdash; longest pairwise distance between points
+on the ROI's convex hull (its Feret diameter).</p>
+<p><b>Max Perp Distance</b> &mdash; the widest perpendicular spread
+relative to that long axis.</p>
+<p><b>Distance Ratio</b> &mdash; Max Distance / Max Perp Distance, an
+elongation score.</p>
+<p><b>Ellipse Circumference</b> &mdash; the circumference of a
+theoretical ellipse with those two distances as its axes.</p>
+<p><b>Shape Perimeter</b> &mdash; the ROI polygon's actual measured
+perimeter.</p>
+<p><b>Circumference/Perimeter Ratio</b> &mdash; the theoretical ellipse
+circumference over the real perimeter, a rough roundness/complexity
+score.</p>
+<p><b>Avg Contact Dist</b> &mdash; average nearest-neighbor distance
+between contact-region pixels (a spacing/clustering measure).</p>
+<p><b>Avg Contact Dist / Union Signal Area</b> &mdash; Avg Contact Dist
+divided by the union-of-all-channels signal area (the same area
+reported as "Union" above).</p>
+"""
+
+
+class MetricsGlossaryDialog(QDialog):
+    """A read-only reference window describing every output metric the
+    plugin can compute, grouped the same way as the Output Selection
+    dialog so the two stay easy to cross-reference."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setWindowTitle("Output Metric Descriptions")
+        self.resize(480, 560)
+
+        layout = QVBoxLayout()
+
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setHtml(METRIC_GLOSSARY_HTML)
+        layout.addWidget(text)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok)
+        bb.accepted.connect(self.accept)
+        layout.addWidget(bb)
+
+        self.setLayout(layout)
 
 
 # -----------------------------
@@ -649,6 +755,9 @@ class OrganelleContactWidget(QWidget):
         self.channel_mode_combo.currentIndexChanged.connect(
             lambda _: self._on_analysis_source_changed()
         )
+        self.channel_mode_combo.currentIndexChanged.connect(
+            lambda _: self._save_settings()
+        )
 
         self.z_range_label = QLabel("Range:")
         self.z_min_spinbox = QSpinBox()
@@ -670,9 +779,15 @@ class OrganelleContactWidget(QWidget):
         self.auto_adjust_z_range_checkbox.stateChanged.connect(
             lambda _: self._update_z_range_controls(force_full_reset=False)
         )
+        self.auto_adjust_z_range_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
 
         self.use_layer_names_checkbox.stateChanged.connect(
             lambda _: self._refresh_channel_labels()
+        )
+        self.use_layer_names_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
         )
 
         try:
@@ -732,6 +847,9 @@ class OrganelleContactWidget(QWidget):
                 ["Otsu", "Li", "Mean", "Minimum", "Triangle", "Yen", "Isodata"]
             )
             self.per_channel_auto.append(auto_combo)
+            auto_combo.currentIndexChanged.connect(
+                lambda _: self._save_settings()
+            )
 
             manual_spin = QDoubleSpinBox()
             manual_spin.setRange(0.0, 1.0)
@@ -739,6 +857,7 @@ class OrganelleContactWidget(QWidget):
             manual_spin.setValue(0.5)
             manual_spin.setEnabled(False)
             self.per_channel_manual.append(manual_spin)
+            manual_spin.valueChanged.connect(lambda _: self._save_settings())
 
             # Line 2: the Automatic method and Manual value, split onto
             # their own line (rather than crammed alongside line 1) so
@@ -775,9 +894,15 @@ class OrganelleContactWidget(QWidget):
             "Calculate metrics separately for each drawn ROI shape, "
             "instead of only for the full image."
         )
+        self.per_shape_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
         self.sequential_label_checkbox = QCheckBox("Sequential ROI labeling")
         self.sequential_label_checkbox.setToolTip(
             "Use sequential labeling for ROI shapes."
+        )
+        self.sequential_label_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
         )
 
         self.prev_roi_button = QPushButton("Previous")
@@ -799,6 +924,9 @@ class OrganelleContactWidget(QWidget):
             QSizePolicy.Preferred, QSizePolicy.Fixed
         )
         self.show_thresh_after_checkbox.setChecked(False)
+        self.show_thresh_after_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
 
         self.show_contacts_after_checkbox = QCheckBox(
             "Auto-show Contacts layer"
@@ -811,6 +939,9 @@ class OrganelleContactWidget(QWidget):
             QSizePolicy.Preferred, QSizePolicy.Fixed
         )
         self.show_contacts_after_checkbox.setChecked(True)
+        self.show_contacts_after_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
 
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.clicked.connect(self.analyze_contacts)
@@ -835,6 +966,15 @@ class OrganelleContactWidget(QWidget):
         self.scale_bar_settings_button = QPushButton("Scale Bar Settings")
         self.scale_bar_settings_button.clicked.connect(
             self.open_scale_bar_settings
+        )
+
+        self.metrics_glossary_button = QPushButton("Metric Descriptions")
+        self.metrics_glossary_button.setToolTip(
+            "Show a description of every output metric this plugin can "
+            "compute."
+        )
+        self.metrics_glossary_button.clicked.connect(
+            self.open_metrics_glossary
         )
 
         self.scale_bar_status_label = QLabel("")
@@ -916,6 +1056,7 @@ class OrganelleContactWidget(QWidget):
         self._metric_display_keys: Optional[List[str]] = None
 
         self.init_ui()
+        self._load_settings()
         self._sync_thresh_mode_states()
         self._refresh_channel_labels()
         self._update_z_range_controls(force_full_reset=True)
@@ -1037,6 +1178,7 @@ class OrganelleContactWidget(QWidget):
         metrics_grid.addWidget(self.output_selection_button, 0, 0)
         metrics_grid.addWidget(self.metric_display_selection_button, 0, 1)
         metrics_grid.addWidget(self.scale_bar_settings_button, 1, 0)
+        metrics_grid.addWidget(self.metrics_glossary_button, 1, 1)
         metrics_grid.setColumnStretch(2, 1)
         metrics_group_layout.addLayout(metrics_grid)
         metrics_group_layout.addWidget(self.scale_bar_status_label)
@@ -1108,6 +1250,7 @@ class OrganelleContactWidget(QWidget):
             else:
                 self.per_channel_auto[i].setEnabled(False)
                 self.per_channel_manual[i].setEnabled(True)
+        self._save_settings()
 
     def _sync_active_channel_row_states(self):
         """Gray out per-channel threshold rows beyond the active channel
@@ -1117,10 +1260,187 @@ class OrganelleContactWidget(QWidget):
         for i in range(self.max_channels_supported):
             self.per_channel_row_widgets[i].setEnabled(i < n)
 
+    # ---------------- Settings persistence ----------------
+    def _settings_snapshot(self) -> Dict[str, Any]:
+        """Everything about the current configuration that's safe to
+        remember across napari sessions: thresholding choices, which
+        metrics to compute/display, and cosmetic preferences.
+        Deliberately excludes anything tied to *this* viewer session --
+        which image layers map to which channel, the current Z range,
+        drawn ROI shapes, stored analyses -- since restoring those
+        against a different image next time could silently point the
+        analysis at the wrong data."""
+        return {
+            "version": SETTINGS_SCHEMA_VERSION,
+            "output_selection": self.output_selection,
+            "enable_intensity_comparisons": self.enable_intensity_comparisons,
+            "intensity_comparisons": self.intensity_comparisons,
+            "channel_mode_index": self.channel_mode_combo.currentIndex(),
+            "use_layer_names": self.use_layer_names_checkbox.isChecked(),
+            "per_channel_mode": [
+                cb.currentIndex() for cb in self.per_channel_mode
+            ],
+            "per_channel_auto": [
+                cb.currentIndex() for cb in self.per_channel_auto
+            ],
+            "per_channel_manual": [
+                sp.value() for sp in self.per_channel_manual
+            ],
+            "contact_threshold": self.threshold,
+            "auto_adjust_z_range": (
+                self.auto_adjust_z_range_checkbox.isChecked()
+            ),
+            "restrict_signal_z": self.restrict_signal_z_checkbox.isChecked(),
+            "restrict_signal_z_channels": self.restrict_signal_z_channels,
+            "show_thresh_after": self.show_thresh_after_checkbox.isChecked(),
+            "show_contacts_after": (
+                self.show_contacts_after_checkbox.isChecked()
+            ),
+            "per_shape": self.per_shape_checkbox.isChecked(),
+            "sequential_label": self.sequential_label_checkbox.isChecked(),
+            "include_scale_bar_in_saved_image": (
+                self.include_scale_bar_in_saved_image
+            ),
+            "saved_scale_bar_length": self.saved_scale_bar_length,
+            "saved_scale_bar_unit": self.saved_scale_bar_unit,
+            "saved_scale_bar_text_size": self.saved_scale_bar_text_size,
+            "metric_display_keys": self._metric_display_keys,
+        }
+
+    def _save_settings(self):
+        # Called from many small change handlers (checkboxes, combos,
+        # dialog "OK" buttons) rather than only on close -- napari
+        # doesn't reliably call closeEvent on this widget when the
+        # whole application quits, so writing through on every change
+        # is the only way this doesn't silently fail to persist.
+        try:
+            settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+            settings.setValue(
+                SETTINGS_KEY, json.dumps(self._settings_snapshot())
+            )
+        except Exception as e:
+            print(f"Warning: could not save widget settings: {e}")
+
+    def _load_settings(self):
+        try:
+            settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+            raw = settings.value(SETTINGS_KEY, None)
+            if not raw:
+                return
+            data = json.loads(raw)
+        except Exception as e:
+            print(f"Warning: could not load saved widget settings: {e}")
+            return
+
+        try:
+            if isinstance(data.get("output_selection"), dict):
+                self.output_selection.update(data["output_selection"])
+
+            self.enable_intensity_comparisons = bool(
+                data.get(
+                    "enable_intensity_comparisons",
+                    self.enable_intensity_comparisons,
+                )
+            )
+            if isinstance(data.get("intensity_comparisons"), list):
+                self.intensity_comparisons = data["intensity_comparisons"]
+
+            if isinstance(data.get("restrict_signal_z_channels"), list):
+                self.restrict_signal_z_channels = [
+                    int(c) for c in data["restrict_signal_z_channels"]
+                ]
+
+            self.include_scale_bar_in_saved_image = bool(
+                data.get(
+                    "include_scale_bar_in_saved_image",
+                    self.include_scale_bar_in_saved_image,
+                )
+            )
+            self.saved_scale_bar_length = float(
+                data.get(
+                    "saved_scale_bar_length", self.saved_scale_bar_length
+                )
+            )
+            self.saved_scale_bar_unit = str(
+                data.get("saved_scale_bar_unit", self.saved_scale_bar_unit)
+            )
+            self.saved_scale_bar_text_size = int(
+                data.get(
+                    "saved_scale_bar_text_size",
+                    self.saved_scale_bar_text_size,
+                )
+            )
+            mdk = data.get("metric_display_keys", None)
+            self._metric_display_keys = (
+                list(mdk) if isinstance(mdk, list) else None
+            )
+
+            # Widget updates last: several of these are wired to also
+            # call _save_settings() on change, so by the time any of
+            # those cascades fire, every plain attribute above is
+            # already in its final restored state.
+            if "channel_mode_index" in data:
+                idx = int(data["channel_mode_index"])
+                if 0 <= idx < self.channel_mode_combo.count():
+                    self.channel_mode_combo.setCurrentIndex(idx)
+
+            self.use_layer_names_checkbox.setChecked(
+                bool(data.get("use_layer_names", False))
+            )
+
+            for i, v in enumerate(data.get("per_channel_mode", [])):
+                if i < len(self.per_channel_mode) and 0 <= int(v) < 2:
+                    self.per_channel_mode[i].setCurrentIndex(int(v))
+
+            for i, v in enumerate(data.get("per_channel_auto", [])):
+                if i < len(self.per_channel_auto):
+                    combo = self.per_channel_auto[i]
+                    if 0 <= int(v) < combo.count():
+                        combo.setCurrentIndex(int(v))
+
+            for i, v in enumerate(data.get("per_channel_manual", [])):
+                if i < len(self.per_channel_manual):
+                    self.per_channel_manual[i].setValue(float(v))
+
+            if "contact_threshold" in data:
+                t = int(np.clip(int(data["contact_threshold"]), 0, 100))
+                self.threshold = t
+                self.ct_slider.setValue(t)
+                self.ct_text.setText(str(t))
+                self.ct_label.setText(f"Threshold (px): {t}")
+
+            self.auto_adjust_z_range_checkbox.setChecked(
+                bool(data.get("auto_adjust_z_range", True))
+            )
+            self.restrict_signal_z_checkbox.setChecked(
+                bool(data.get("restrict_signal_z", False))
+            )
+            self.show_thresh_after_checkbox.setChecked(
+                bool(data.get("show_thresh_after", False))
+            )
+            self.show_contacts_after_checkbox.setChecked(
+                bool(data.get("show_contacts_after", True))
+            )
+            self.per_shape_checkbox.setChecked(
+                bool(data.get("per_shape", False))
+            )
+            self.sequential_label_checkbox.setChecked(
+                bool(data.get("sequential_label", False))
+            )
+        except Exception as e:
+            print(f"Warning: error applying saved widget settings: {e}")
+
+        # Belt-and-suspenders: guarantees the persisted file reflects
+        # everything just restored, regardless of exactly which widget
+        # changes above did or didn't trigger their own save via a
+        # connected signal.
+        self._save_settings()
+
     def slider_changed(self, value):
         self.threshold = value
         self.ct_label.setText(f"Threshold (px): {self.threshold}")
         self.ct_text.setText(str(self.threshold))
+        self._save_settings()
 
     def text_input_changed(self):
         try:
@@ -1131,6 +1451,7 @@ class OrganelleContactWidget(QWidget):
         self.threshold = value
         self.ct_label.setText(f"Threshold (px): {self.threshold}")
         self.ct_slider.setValue(self.threshold)
+        self._save_settings()
 
     def _get_image_layers(self) -> List["napari.layers.Image"]:
         return [
@@ -1257,6 +1578,7 @@ class OrganelleContactWidget(QWidget):
     def _on_restrict_signal_z_changed(self, state):
         self.restrict_to_signal_z = bool(state)
         self.restrict_signal_z_button.setEnabled(bool(state))
+        self._save_settings()
 
     def _get_default_restrict_signal_z_channels(
         self, n_channels: int
@@ -1513,6 +1835,7 @@ class OrganelleContactWidget(QWidget):
             self.output_selection = sel
             self.enable_intensity_comparisons = enable_comp
             self.intensity_comparisons = comps
+            self._save_settings()
 
     def open_channel_numbering(self):
         layers = self._get_image_layers()
@@ -1592,6 +1915,7 @@ class OrganelleContactWidget(QWidget):
                 self._metric_display_keys = []
             else:
                 self._metric_display_keys = None
+            self._save_settings()
             if isinstance(self.last_metrics, list) and self.last_metrics:
                 self.update_roi_display()
             elif isinstance(self.last_metrics, dict) and self.last_metrics:
@@ -1674,6 +1998,11 @@ class OrganelleContactWidget(QWidget):
             self.saved_scale_bar_unit = str(unit_combo.currentText())
             self.saved_scale_bar_text_size = int(text_spin.value())
             self._update_scale_bar_status_label()
+            self._save_settings()
+
+    def open_metrics_glossary(self):
+        dlg = MetricsGlossaryDialog(self)
+        dlg.exec_()
 
     def open_signal_z_channel_selection(self):
         n = self._get_active_channel_count()
@@ -1711,6 +2040,7 @@ class OrganelleContactWidget(QWidget):
             self.restrict_signal_z_channels = (
                 selected if selected else list(range(n))
             )
+            self._save_settings()
 
     # ---------------- Analysis ----------------
     def analyze_contacts(self):
