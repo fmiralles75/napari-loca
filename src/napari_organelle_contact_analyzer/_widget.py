@@ -620,8 +620,13 @@ class OrganelleContactWidget(QWidget):
         self.restrict_to_signal_z = False
         self.restrict_signal_z_channels: List[int] = []
 
-        self.ct_label = QLabel(f"Contact Threshold (pixels): {self.threshold}")
+        self.ct_label = QLabel(f"Threshold (px): {self.threshold}")
         self.ct_label.setAlignment(Qt.AlignCenter)
+        self.ct_label.setToolTip(
+            "Contact threshold, in pixels: the maximum distance between "
+            "two channels' thresholded signal for them to be counted as "
+            "'in contact'."
+        )
         self.ct_slider = QSlider(Qt.Horizontal)
         self.ct_slider.setMinimum(0)
         self.ct_slider.setMaximum(100)
@@ -631,21 +636,28 @@ class OrganelleContactWidget(QWidget):
         self.ct_text.setValidator(QIntValidator(0, 100))
         self.ct_text.editingFinished.connect(self.text_input_changed)
 
-        self.channels_label = QLabel("Number of Channels:")
+        self.channels_label = QLabel("Channels:")
         self.channel_mode_combo = QComboBox()
         self.channel_mode_combo.addItems(["2", "3", "4"])
+        self.channel_mode_combo.setToolTip(
+            "How many image layers to treat as channels for analysis."
+        )
         self.channel_mode_combo.currentIndexChanged.connect(
             lambda _: self._on_analysis_source_changed()
         )
 
-        self.z_range_label = QLabel("Z-stack Range:")
+        self.z_range_label = QLabel("Range:")
         self.z_min_spinbox = QSpinBox()
         self.z_max_spinbox = QSpinBox()
         self.z_min_spinbox.setMinimum(0)
         self.z_max_spinbox.setMinimum(0)
 
         self.auto_adjust_z_range_checkbox = QCheckBox(
-            "Auto-adjust Z-stack range to current image"
+            "Auto-adjust Z range to image"
+        )
+        self.auto_adjust_z_range_checkbox.setToolTip(
+            "Automatically reset the Z min/max range whenever a new image "
+            "or channel is selected."
         )
         self.auto_adjust_z_range_checkbox.setChecked(True)
         self.auto_adjust_z_range_checkbox.setSizePolicy(
@@ -674,35 +686,48 @@ class OrganelleContactWidget(QWidget):
 
         self.channel_thresh_container = QWidget()
         self.channel_thresh_layout = QVBoxLayout()
+        self.channel_thresh_layout.setSpacing(10)
         self.channel_thresh_container.setLayout(self.channel_thresh_layout)
         self.per_channel_mode: List[QComboBox] = []
         self.per_channel_auto: List[QComboBox] = []
         self.per_channel_manual: List[QDoubleSpinBox] = []
         self.per_channel_label_widgets: List[QLabel] = []
+        # One QWidget per channel (rather than a bare layout) so the whole
+        # row -- label, mode combo, auto combo, manual spinbox -- can be
+        # grayed out together via a single setEnabled(False) call when a
+        # channel isn't part of the active channel count (see
+        # _sync_active_channel_row_states).
+        self.per_channel_row_widgets: List[QWidget] = []
 
-        _thresh_rows: List[QHBoxLayout] = []
+        _thresh_rows: List[QWidget] = []
         for i in range(self.max_channels_supported):
-            row = QHBoxLayout()
+            row_widget = QWidget()
+            row_outer = QVBoxLayout(row_widget)
+            row_outer.setContentsMargins(0, 0, 0, 0)
+            row_outer.setSpacing(2)
 
             label = QLabel(f"Channel {i+1}:")
             label.setWordWrap(True)
-            label.setMaximumWidth(260)
+            label.setMaximumWidth(150)
             label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
             self.per_channel_label_widgets.append(label)
-            row.addWidget(label)
 
             mode_combo = QComboBox()
             mode_combo.addItems(["Automatic", "Manual"])
             self.per_channel_mode.append(mode_combo)
-            row.addWidget(mode_combo)
+
+            # Line 1: which channel, and Automatic vs. Manual thresholding.
+            line1 = QHBoxLayout()
+            line1.addWidget(label)
+            line1.addWidget(mode_combo)
+            line1.addStretch(1)
+            row_outer.addLayout(line1)
 
             auto_combo = QComboBox()
             auto_combo.addItems(
                 ["Otsu", "Li", "Mean", "Minimum", "Triangle", "Yen", "Isodata"]
             )
             self.per_channel_auto.append(auto_combo)
-            row.addWidget(QLabel("Auto:"))
-            row.addWidget(auto_combo)
 
             manual_spin = QDoubleSpinBox()
             manual_spin.setRange(0.0, 1.0)
@@ -710,16 +735,26 @@ class OrganelleContactWidget(QWidget):
             manual_spin.setValue(0.5)
             manual_spin.setEnabled(False)
             self.per_channel_manual.append(manual_spin)
-            row.addWidget(QLabel("Manual:"))
-            row.addWidget(manual_spin)
+
+            # Line 2: the Automatic method and Manual value, split onto
+            # their own line (rather than crammed alongside line 1) so
+            # this fits in a narrow napari dock without a horizontal
+            # scrollbar.
+            line2 = QHBoxLayout()
+            line2.addWidget(QLabel("Auto:"))
+            line2.addWidget(auto_combo)
+            line2.addWidget(QLabel("Manual:"))
+            line2.addWidget(manual_spin)
+            row_outer.addLayout(line2)
 
             mode_combo.currentIndexChanged.connect(
                 self._sync_thresh_mode_states
             )
-            _thresh_rows.append(row)
+            self.per_channel_row_widgets.append(row_widget)
+            _thresh_rows.append(row_widget)
 
-        for row in reversed(_thresh_rows):
-            self.channel_thresh_layout.addLayout(row)
+        for row_widget in reversed(_thresh_rows):
+            self.channel_thresh_layout.addWidget(row_widget)
 
         self.result_label = QLabel("Metrics: N/A")
         self.result_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
@@ -731,19 +766,30 @@ class OrganelleContactWidget(QWidget):
         self.analysis_count_label = QLabel("Analyses Stored: 0")
         self.analysis_count_label.setAlignment(Qt.AlignCenter)
 
-        self.per_shape_checkbox = QCheckBox("Calculate metrics per ROI shape")
-        self.sequential_label_checkbox = QCheckBox(
-            "Use sequential labeling for ROI shapes"
+        self.per_shape_checkbox = QCheckBox("Calculate metrics per ROI")
+        self.per_shape_checkbox.setToolTip(
+            "Calculate metrics separately for each drawn ROI shape, "
+            "instead of only for the full image."
+        )
+        self.sequential_label_checkbox = QCheckBox("Sequential ROI labeling")
+        self.sequential_label_checkbox.setToolTip(
+            "Use sequential labeling for ROI shapes."
         )
 
-        self.prev_roi_button = QPushButton("Previous ROI")
-        self.next_roi_button = QPushButton("Next ROI")
+        self.prev_roi_button = QPushButton("Previous")
+        self.next_roi_button = QPushButton("Next")
+        self.prev_roi_button.setToolTip("Previous ROI")
+        self.next_roi_button.setToolTip("Next ROI")
         self.roi_nav_label = QLabel("ROI: N/A")
         self.prev_roi_button.clicked.connect(self.prev_roi)
         self.next_roi_button.clicked.connect(self.next_roi)
 
         self.show_thresh_after_checkbox = QCheckBox(
-            "Show thresholded layers after Analyze"
+            "Auto-show thresholded layers"
+        )
+        self.show_thresh_after_checkbox.setToolTip(
+            "Automatically display each channel's thresholded mask as a "
+            "layer after running Analyze."
         )
         self.show_thresh_after_checkbox.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Fixed
@@ -751,7 +797,11 @@ class OrganelleContactWidget(QWidget):
         self.show_thresh_after_checkbox.setChecked(False)
 
         self.show_contacts_after_checkbox = QCheckBox(
-            "Show Contacts layer after Analyze"
+            "Auto-show Contacts layer"
+        )
+        self.show_contacts_after_checkbox.setToolTip(
+            "Automatically display the Contacts layer after running "
+            "Analyze."
         )
         self.show_contacts_after_checkbox.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Fixed
@@ -787,7 +837,10 @@ class OrganelleContactWidget(QWidget):
         self.scale_bar_status_label.setWordWrap(True)
 
         self.restrict_signal_z_checkbox = QCheckBox(
-            "Restrict analyzed Z-stacks to slices with thresholded signal"
+            "Restrict Z range to signal"
+        )
+        self.restrict_signal_z_checkbox.setToolTip(
+            "Restrict analyzed Z-stacks to slices with thresholded signal."
         )
         self.restrict_signal_z_checkbox.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Fixed
@@ -798,6 +851,10 @@ class OrganelleContactWidget(QWidget):
         )
 
         self.restrict_signal_z_button = QPushButton("Signal Z Channels")
+        self.restrict_signal_z_button.setToolTip(
+            "Choose which channels' thresholded signal determines the "
+            "Z-restriction above."
+        )
         self.restrict_signal_z_button.clicked.connect(
             self.open_signal_z_channel_selection
         )
@@ -806,10 +863,12 @@ class OrganelleContactWidget(QWidget):
         self.add_analysis_button = QPushButton("Add Analysis")
         self.add_analysis_button.clicked.connect(self.add_analysis)
 
-        self.clear_last_button = QPushButton("Clear Last Analysis")
+        self.clear_last_button = QPushButton("Clear Last")
+        self.clear_last_button.setToolTip("Clear Last Analysis")
         self.clear_last_button.clicked.connect(self.clear_last_analysis)
 
-        self.clear_all_button = QPushButton("Clear All Analyses")
+        self.clear_all_button = QPushButton("Clear All")
+        self.clear_all_button.setToolTip("Clear All Analyses")
         self.clear_all_button.clicked.connect(self.clear_all_analyses)
 
         self.save_image_button = QPushButton("Save Image")
@@ -818,12 +877,16 @@ class OrganelleContactWidget(QWidget):
         self.save_metrics_button = QPushButton("Export to Excel")
         self.save_metrics_button.clicked.connect(self.save_metrics)
 
-        self.append_spreadsheet_button = QPushButton("Append to Excel Format")
+        self.append_spreadsheet_button = QPushButton("Append to Excel")
+        self.append_spreadsheet_button.setToolTip(
+            "Append to Excel Format"
+        )
         self.append_spreadsheet_button.clicked.connect(
             self.append_to_spreadsheet
         )
 
-        self.export_graphpad_button = QPushButton("Export for GraphPad Prism")
+        self.export_graphpad_button = QPushButton("Export to GraphPad")
+        self.export_graphpad_button.setToolTip("Export for GraphPad Prism")
         self.export_graphpad_button.clicked.connect(self.export_graphpad_prism)
 
         self.append_graphpad_button = QPushButton("Append to GraphPad")
@@ -836,7 +899,8 @@ class OrganelleContactWidget(QWidget):
 
         self.show_thresh_btns: List[QPushButton] = []
         for i in range(self.max_channels_supported):
-            b = QPushButton(f"Show Thresholded Ch {i+1}")
+            b = QPushButton(f"Show Ch {i+1}")
+            b.setToolTip(f"Show Thresholded Channel {i+1}")
             b.clicked.connect(
                 lambda _, idx=i: self.show_thresholded_channel(idx)
             )
@@ -855,25 +919,44 @@ class OrganelleContactWidget(QWidget):
         self._update_scale_bar_status_label()
 
     # ---------------- UI ----------------
+    def _group_box(self, title: str, inner_layout) -> QGroupBox:
+        """Build a titled QGroupBox around ``inner_layout``. A shared
+        helper so every section of the widget gets the same visual
+        treatment (title styling, margins) with one place to adjust it."""
+        box = QGroupBox(title)
+        inner_layout.setContentsMargins(6, 4, 6, 6)
+        inner_layout.setSpacing(4)
+        box.setLayout(inner_layout)
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        return box
+
     def init_ui(self):
+        # The widget is organized into labeled sections that follow the
+        # order a user works through the plugin: pick channels, set the
+        # Z range, threshold each channel, optionally draw ROIs, run the
+        # contact analysis, configure what's measured/displayed, review
+        # and manage results, then export.
         container = QWidget()
         container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(6)
+        layout.setSpacing(8)
 
-        ct_layout = QHBoxLayout()
-        ct_layout.addWidget(self.ct_label)
-        ct_layout.addWidget(self.ct_slider)
-        ct_layout.addWidget(self.ct_text)
-        layout.addLayout(ct_layout)
-
+        # --- Channel & Image Setup ---
+        setup_layout = QVBoxLayout()
         channel_layout = QHBoxLayout()
         channel_layout.addWidget(self.channels_label)
         channel_layout.addWidget(self.channel_mode_combo)
         channel_layout.addStretch(1)
-        layout.addLayout(channel_layout)
+        setup_layout.addLayout(channel_layout)
+        setup_layout.addWidget(self.use_layer_names_checkbox)
+        setup_layout.addWidget(self.channel_numbering_button)
+        layout.addWidget(
+            self._group_box("Channel && Image Setup", setup_layout)
+        )
 
+        # --- Z-Stack Range ---
+        z_group_layout = QVBoxLayout()
         z_layout = QHBoxLayout()
         z_layout.addWidget(self.z_range_label)
         z_layout.addWidget(QLabel("Min:"))
@@ -881,60 +964,88 @@ class OrganelleContactWidget(QWidget):
         z_layout.addWidget(QLabel("Max:"))
         z_layout.addWidget(self.z_max_spinbox)
         z_layout.addStretch(1)
-        layout.addLayout(z_layout)
-
-        layout.addWidget(self.auto_adjust_z_range_checkbox)
-        layout.addWidget(self.use_layer_names_checkbox)
-        layout.addWidget(self.channel_thresh_container)
-
-        analyze_grid = QGridLayout()
-        analyze_grid.addWidget(self.analyze_button, 0, 0)
-        analyze_grid.addWidget(self.output_selection_button, 0, 1)
-        analyze_grid.addWidget(self.channel_numbering_button, 0, 2)
-        analyze_grid.addWidget(self.metric_display_selection_button, 1, 0)
-        analyze_grid.addWidget(self.scale_bar_settings_button, 1, 1)
-        analyze_grid.setColumnStretch(2, 1)
-        layout.addLayout(analyze_grid)
-
-        restrict_z_layout = QVBoxLayout()
-        restrict_z_layout.addWidget(self.restrict_signal_z_checkbox)
-        restrict_z_layout.addWidget(
+        z_group_layout.addLayout(z_layout)
+        z_group_layout.addWidget(self.auto_adjust_z_range_checkbox)
+        z_group_layout.addWidget(self.restrict_signal_z_checkbox)
+        z_group_layout.addWidget(
             self.restrict_signal_z_button, alignment=Qt.AlignLeft
         )
-        layout.addLayout(restrict_z_layout)
+        layout.addWidget(self._group_box("Z-Stack Range", z_group_layout))
 
-        layout.addWidget(self.scale_bar_status_label)
+        # --- Thresholding ---
+        thresh_group_layout = QVBoxLayout()
+        thresh_group_layout.addWidget(self.channel_thresh_container)
+        thresh_group_layout.addWidget(self.show_thresh_after_checkbox)
+        thresh_btn_layout = QGridLayout()
+        for i, b in enumerate(self.show_thresh_btns):
+            thresh_btn_layout.addWidget(b, i // 2, i % 2)
+        thresh_group_layout.addLayout(thresh_btn_layout)
+        layout.addWidget(self._group_box("Thresholding", thresh_group_layout))
 
-        toggle_layout = QVBoxLayout()
-        toggle_layout.addWidget(self.show_thresh_after_checkbox)
-        toggle_layout.addWidget(self.show_contacts_after_checkbox)
-        layout.addLayout(toggle_layout)
-
-        layout.addWidget(self.result_label)
-
+        # --- ROI Tools ---
+        roi_group_layout = QVBoxLayout()
+        roi_group_layout.addWidget(self.roi_button)
+        roi_group_layout.addWidget(self.per_shape_checkbox)
+        roi_group_layout.addWidget(self.sequential_label_checkbox)
         nav_layout = QHBoxLayout()
         nav_layout.addWidget(self.prev_roi_button)
         nav_layout.addWidget(self.roi_nav_label)
         nav_layout.addWidget(self.next_roi_button)
         nav_layout.addStretch(1)
-        layout.addLayout(nav_layout)
+        roi_group_layout.addLayout(nav_layout)
+        layout.addWidget(self._group_box("ROI Tools", roi_group_layout))
 
+        # --- Contact Analysis ---
+        contact_group_layout = QVBoxLayout()
+        ct_layout = QHBoxLayout()
+        ct_layout.addWidget(self.ct_label)
+        ct_layout.addWidget(self.ct_slider)
+        ct_layout.addWidget(self.ct_text)
+        contact_group_layout.addLayout(ct_layout)
+        contact_group_layout.addWidget(self.analyze_button)
+        contact_group_layout.addWidget(self.show_contacts_after_checkbox)
+        contact_group_layout.addWidget(self.show_contacts_button)
+        layout.addWidget(
+            self._group_box("Contact Analysis", contact_group_layout)
+        )
+
+        # --- Metrics & Display Settings ---
+        metrics_group_layout = QVBoxLayout()
+        metrics_grid = QGridLayout()
+        metrics_grid.addWidget(self.output_selection_button, 0, 0)
+        metrics_grid.addWidget(self.metric_display_selection_button, 0, 1)
+        metrics_grid.addWidget(self.scale_bar_settings_button, 1, 0)
+        metrics_grid.setColumnStretch(2, 1)
+        metrics_group_layout.addLayout(metrics_grid)
+        metrics_group_layout.addWidget(self.scale_bar_status_label)
+        layout.addWidget(
+            self._group_box(
+                "Metrics && Display Settings", metrics_group_layout
+            )
+        )
+
+        # --- Results & Analysis Management ---
+        results_group_layout = QVBoxLayout()
+        results_group_layout.addWidget(self.result_label)
         analysis_name_layout = QHBoxLayout()
         analysis_name_layout.addWidget(self.analysis_name_label)
         analysis_name_layout.addWidget(self.analysis_name_edit)
-        layout.addLayout(analysis_name_layout)
+        results_group_layout.addLayout(analysis_name_layout)
+        results_group_layout.addWidget(self.analysis_count_label)
+        manage_grid1 = QGridLayout()
+        manage_grid1.addWidget(self.add_analysis_button, 0, 0)
+        manage_grid1.addWidget(self.clear_last_button, 0, 1)
+        manage_grid1.addWidget(self.clear_all_button, 1, 0)
+        manage_grid1.setColumnStretch(2, 1)
+        results_group_layout.addLayout(manage_grid1)
+        layout.addWidget(
+            self._group_box(
+                "Results && Analysis Management", results_group_layout
+            )
+        )
 
-        layout.addWidget(self.analysis_count_label)
-        layout.addWidget(self.per_shape_checkbox)
-        layout.addWidget(self.sequential_label_checkbox)
-
-        manage_layout1 = QHBoxLayout()
-        manage_layout1.addWidget(self.add_analysis_button)
-        manage_layout1.addWidget(self.clear_last_button)
-        manage_layout1.addWidget(self.clear_all_button)
-        manage_layout1.addStretch(1)
-        layout.addLayout(manage_layout1)
-
+        # --- Saving & Export ---
+        save_group_layout = QVBoxLayout()
         manage_grid = QGridLayout()
         manage_grid.addWidget(self.save_image_button, 0, 0)
         manage_grid.addWidget(self.save_metrics_button, 0, 1)
@@ -942,15 +1053,10 @@ class OrganelleContactWidget(QWidget):
         manage_grid.addWidget(self.export_graphpad_button, 1, 1)
         manage_grid.addWidget(self.append_graphpad_button, 2, 0)
         manage_grid.setColumnStretch(2, 1)
-        layout.addLayout(manage_grid)
-
-        layout.addWidget(self.roi_button)
-        layout.addWidget(self.show_contacts_button)
-
-        thresh_btn_layout = QGridLayout()
-        for i, b in enumerate(self.show_thresh_btns):
-            thresh_btn_layout.addWidget(b, i // 2, i % 2)
-        layout.addLayout(thresh_btn_layout)
+        save_group_layout.addLayout(manage_grid)
+        layout.addWidget(
+            self._group_box("Saving && Export", save_group_layout)
+        )
 
         layout.addStretch(1)
         container.setLayout(layout)
@@ -958,7 +1064,12 @@ class OrganelleContactWidget(QWidget):
         scroll = QScrollArea()
         scroll.setWidget(container)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # The sections above are laid out narrow enough (2-column button
+        # grids, wrapped per-channel threshold rows, shortened labels) to
+        # fit napari's default dock width without needing to scroll
+        # sideways -- so the horizontal scrollbar is disabled outright
+        # rather than left on "as needed".
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         main_layout = QVBoxLayout()
@@ -976,9 +1087,17 @@ class OrganelleContactWidget(QWidget):
                 self.per_channel_auto[i].setEnabled(False)
                 self.per_channel_manual[i].setEnabled(True)
 
+    def _sync_active_channel_row_states(self):
+        """Gray out per-channel threshold rows beyond the active channel
+        count (set via the "Channels" combo), so it's obvious at a
+        glance which rows actually affect the analysis."""
+        n = self._get_active_channel_count()
+        for i in range(self.max_channels_supported):
+            self.per_channel_row_widgets[i].setEnabled(i < n)
+
     def slider_changed(self, value):
         self.threshold = value
-        self.ct_label.setText(f"Contact Threshold (pixels): {self.threshold}")
+        self.ct_label.setText(f"Threshold (px): {self.threshold}")
         self.ct_text.setText(str(self.threshold))
 
     def text_input_changed(self):
@@ -988,7 +1107,7 @@ class OrganelleContactWidget(QWidget):
             return
         value = max(0, min(value, 100))
         self.threshold = value
-        self.ct_label.setText(f"Contact Threshold (pixels): {self.threshold}")
+        self.ct_label.setText(f"Threshold (px): {self.threshold}")
         self.ct_slider.setValue(self.threshold)
 
     def _get_image_layers(self) -> List["napari.layers.Image"]:
@@ -1182,11 +1301,15 @@ class OrganelleContactWidget(QWidget):
 
     def _apply_label_qol(self, label_widget: QLabel, text: str):
         label_widget.setWordWrap(True)
-        label_widget.setMaximumWidth(260)
+        # Kept in sync with the per-channel row label's own
+        # setMaximumWidth(150) at creation time (see __init__) -- the
+        # row now shares its line with the mode combo, so it needs to
+        # stay narrower than it used to when it had the line to itself.
+        label_widget.setMaximumWidth(150)
         label_widget.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Preferred
         )
-        if text and len(text) > 24:
+        if text and len(text) > 14:
             label_widget.setStyleSheet("font-size: 10px;")
         else:
             label_widget.setStyleSheet("")
@@ -1224,6 +1347,7 @@ class OrganelleContactWidget(QWidget):
                 txt = f"Channel {i+1}:"
                 self.per_channel_label_widgets[i].setText(txt)
                 self._apply_label_qol(self.per_channel_label_widgets[i], txt)
+        self._sync_active_channel_row_states()
 
     def _get_signals_for_analysis(
         self,
