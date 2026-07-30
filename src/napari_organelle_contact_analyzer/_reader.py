@@ -15,9 +15,18 @@ this supports:
 
 See https://allencellmodeling.github.io/aicsimageio/ for the full list of
 formats aicsimageio can be extended to support.
+
+Multi-channel images are split into separate, independently toggleable
+image layers (one per channel) via napari's own ``channel_axis`` mechanism
+on ``add_image()``, the same approach the community ``napari-aicsimageio``
+plugin uses -- and the layer structure this plugin's own widget (the
+per-channel dropdowns backed by ``channel_layer_indices`` in ``_widget.py``)
+was built around in the first place, rather than one combined
+multi-channel array.
 """
 
-from typing import Any, Dict, List, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 
@@ -47,8 +56,6 @@ def napari_get_reader(path: Union[str, List[str]]):
         path = path[0]
 
     if _is_nd2_path(path):
-        # TEMPORARY DIAGNOSTIC: see matching note in _read_nd2().
-        print("=== napari-organelle-contact-analyzer: napari_get_reader() probing", path, "===")
         try:
             import nd2
         except ImportError:
@@ -95,7 +102,9 @@ def reader_function(path: Union[str, List[str]]):
     -------
     layer_data : list of tuples
         A single-element list of (data, add_kwargs, layer_type) tuples,
-        per the napari reader contract.
+        per the napari reader contract. ``add_kwargs`` may include
+        ``channel_axis``, in which case napari itself splits the array
+        into one layer per channel.
     """
     if isinstance(path, list):
         path = path[0]
@@ -105,60 +114,82 @@ def reader_function(path: Union[str, List[str]]):
     return _read_with_aicsimageio(path)
 
 
+def _channel_axis_kwargs(
+    dims_used: str,
+    data_shape: tuple,
+    path: str,
+    channel_names: Optional[List[str]],
+    scale_by_letter: Dict[str, Optional[float]],
+) -> Dict[str, Any]:
+    """Build the ``name`` / ``channel_axis`` / ``scale`` add_kwargs.
+
+    Shared between the ND2 and aicsimageio reading paths so both produce
+    the same layer structure: one image layer per channel (via
+    ``channel_axis``) when a channel dimension is present, a single
+    named layer otherwise, plus physical-pixel ``scale`` for whichever
+    of Z/Y/X are present.
+    """
+    kwargs: Dict[str, Any] = {}
+
+    if "C" in dims_used:
+        c_axis = dims_used.index("C")
+        n_channels = data_shape[c_axis]
+        kwargs["channel_axis"] = c_axis
+        if channel_names and len(channel_names) == n_channels:
+            kwargs["name"] = channel_names
+        else:
+            kwargs["name"] = [f"Channel {i + 1}" for i in range(n_channels)]
+    else:
+        kwargs["name"] = Path(path).stem
+
+    scale = [
+        scale_by_letter[letter]
+        for letter in dims_used
+        if letter in scale_by_letter
+    ]
+    if scale and all(s is not None and s > 0 for s in scale):
+        kwargs["scale"] = tuple(scale)
+
+    return kwargs
+
+
 def _read_nd2(path: str):
     """Read an ND2 file with the ``nd2`` package directly.
 
     Deliberately bypasses aicsimageio for this one format. Two earlier
-    attempts to fix the "ND2File file not closed before garbage
+    attempts to fix a "ND2File file not closed before garbage
     collection" warning by working around aicsimageio's internal
-    caching (avoiding ``img.dims``, then pre-warming
-    ``Reader.xarray_data`` before aicsimageio's own mosaic-tile check
-    could force a delayed read) both turned out to be incomplete --
-    aicsimageio's ND2 support goes through several layers of internal
-    caching, an unconditional mosaic-tile check, and (for the delayed
-    path) nd2's own dask wrapping via ``ResourceBackedDaskArray``,
-    and the exact combination that leaves a ``nd2.ND2File`` handle
-    open long enough to be garbage-collected wasn't fully pinned down
-    even after reading through aicsimageio's and nd2's source directly.
-    Reading here with one explicit, fully eager ``with nd2.ND2File(...)``
-    block -- no dask, no delayed xarray, no aicsimageio in the loop at
-    all -- removes that uncertainty rather than continuing to guess at
-    aicsimageio's internals.
+    caching turned out to be chasing the wrong cause entirely: the
+    warning was traced (via temporary diagnostic prints, since removed)
+    to a *different*, separately-installed napari plugin
+    (``napari-aicsimageio``) actually being the one napari was using to
+    open these files -- not this plugin's own reader. Reading directly
+    with ``nd2`` here, in one explicit ``with`` block, avoids depending
+    on aicsimageio's ND2 handling regardless.
     """
     import nd2
-
-    # TEMPORARY DIAGNOSTIC: three fixes in a row haven't stopped the
-    # warning, which raises the question of whether this function is
-    # even the code path being run for .nd2 files, versus some other
-    # installed plugin/reader also handling them. This print is
-    # deliberately impossible to miss in the terminal output -- if it
-    # does NOT appear right before the warning, that confirms this
-    # code isn't the source and the search needs to go elsewhere.
-    # Safe to remove once that's settled.
-    print("=== napari-organelle-contact-analyzer: _read_nd2() called for", path, "===")
 
     with nd2.ND2File(path) as f:
         data = np.asarray(f.asarray())
         native_order = list(f.sizes.keys())  # e.g. ['T', 'C', 'Z', 'Y', 'X']
-        print(
-            "=== napari-organelle-contact-analyzer: nd2.ND2File closed?",
-            f.closed,
-            "(should be False here, inside the `with` block) ===",
-        )
-
-    print(
-        "=== napari-organelle-contact-analyzer: after `with` block, "
-        "file should now be closed ==="
-    )
+        try:
+            channel_names = [
+                c.channel.name for c in (f.metadata.channels or [])
+            ] or None
+        except Exception:
+            channel_names = None
+        try:
+            voxel = f.voxel_size()  # VoxelSize(x=.., y=.., z=..)
+        except Exception:
+            voxel = None
 
     # Reorder nd2's native axes to match whichever of "CZYX" / "ZYX" /
     # "YX" the file actually has all of -- the same cascade the
-    # aicsimageio-based path used -- so downstream code (channel
+    # aicsimageio-based path uses -- so downstream code (channel
     # splitting, the ndim>3 squeezes elsewhere in this plugin) sees a
     # consistent axis layout regardless of which reader produced the
     # array. Any other axes nd2 reports (T, P/position, etc.) are
-    # moved to the front, to be dropped by the same "ndim > 4" squeeze
-    # used for every other format below.
+    # moved to the front, to be dropped by the "ndim > 4" squeeze below.
     target = None
     for candidate in ("CZYX", "ZYX", "YX"):
         if all(letter in native_order for letter in candidate):
@@ -174,6 +205,7 @@ def _read_nd2(path: str):
 
     while data.ndim > 4:
         data = data[0]
+        dims_used = dims_used[1:]
 
     add_kwargs: Dict[str, Any] = {
         "metadata": {
@@ -182,6 +214,14 @@ def _read_nd2(path: str):
             "aics_dims": f"{dims_used}{data.shape}",
         }
     }
+    scale_by_letter = (
+        {"Z": voxel.z, "Y": voxel.y, "X": voxel.x} if voxel is not None else {}
+    )
+    add_kwargs.update(
+        _channel_axis_kwargs(
+            dims_used, data.shape, path, channel_names, scale_by_letter
+        )
+    )
     return [(data, add_kwargs, "image")]
 
 
@@ -207,6 +247,18 @@ def _read_with_aicsimageio(path: str):
         data = np.asarray(data)
         while isinstance(data, np.ndarray) and data.ndim > 4:
             data = data[0]
+            dims_used = dims_used[1:]
+
+        try:
+            channel_names = img.channel_names
+        except Exception:
+            channel_names = None
+
+        try:
+            pps = img.physical_pixel_sizes
+            scale_by_letter = {"Z": pps.Z, "Y": pps.Y, "X": pps.X}
+        except Exception:
+            scale_by_letter = {}
 
         # NOTE: these must go under the "metadata" key, not be spread
         # directly into add_kwargs -- viewer.add_image() has no
@@ -219,6 +271,11 @@ def _read_with_aicsimageio(path: str):
                 "aics_dims": f"{dims_used}{data.shape}",
             }
         }
+        add_kwargs.update(
+            _channel_axis_kwargs(
+                dims_used, data.shape, path, channel_names, scale_by_letter
+            )
+        )
         return [(data, add_kwargs, "image")]
     finally:
         if img is not None and hasattr(img, "close"):
