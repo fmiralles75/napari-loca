@@ -924,6 +924,24 @@ class OrganelleContactWidget(QWidget):
         helper so every section of the widget gets the same visual
         treatment (title styling, margins) with one place to adjust it."""
         box = QGroupBox(title)
+        # Nudge the title a few pixels above the box's top border (via a
+        # negative "top" offset) and add matching top padding inside the
+        # box, so the title has clear space of its own instead of
+        # crowding the first row of controls beneath it.
+        box.setStyleSheet(
+            "QGroupBox {"
+            "  font-weight: bold;"
+            "  margin-top: 10px;"
+            "  padding-top: 12px;"
+            "}"
+            "QGroupBox::title {"
+            "  subcontrol-origin: margin;"
+            "  subcontrol-position: top left;"
+            "  left: 6px;"
+            "  top: -4px;"
+            "  padding: 0 3px;"
+            "}"
+        )
         inner_layout.setContentsMargins(6, 4, 6, 6)
         inner_layout.setSpacing(4)
         box.setLayout(inner_layout)
@@ -1047,11 +1065,11 @@ class OrganelleContactWidget(QWidget):
         # --- Saving & Export ---
         save_group_layout = QVBoxLayout()
         manage_grid = QGridLayout()
-        manage_grid.addWidget(self.save_image_button, 0, 0)
-        manage_grid.addWidget(self.save_metrics_button, 0, 1)
-        manage_grid.addWidget(self.append_spreadsheet_button, 1, 0)
+        manage_grid.addWidget(self.save_image_button, 0, 0, 1, 2)
+        manage_grid.addWidget(self.save_metrics_button, 1, 0)
         manage_grid.addWidget(self.export_graphpad_button, 1, 1)
-        manage_grid.addWidget(self.append_graphpad_button, 2, 0)
+        manage_grid.addWidget(self.append_spreadsheet_button, 2, 0)
+        manage_grid.addWidget(self.append_graphpad_button, 2, 1)
         manage_grid.setColumnStretch(2, 1)
         save_group_layout.addLayout(manage_grid)
         layout.addWidget(
