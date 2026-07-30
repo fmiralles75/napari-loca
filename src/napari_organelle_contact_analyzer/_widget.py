@@ -51,7 +51,7 @@ from qtpy.QtWidgets import (
 
 from skimage import filters
 from skimage.util import img_as_float
-from scipy.ndimage import distance_transform_edt
+from scipy.ndimage import distance_transform_edt, label as ndi_label
 from skimage.draw import polygon
 import numpy as np
 import pandas as pd
@@ -427,14 +427,21 @@ class OutputSelectionDialog(QDialog):
         self.cb_intersection_over_ch = QCheckBox(
             "Intersection / Channel Signal Area (per channel)"
         )
+        self.cb_fragmentation = QCheckBox(
+            "Fragmentation Coefficient / Body Count (per channel)"
+        )
         self.cb_signal_area.setChecked(
             self._selection.get("Signal Area", True)
         )
         self.cb_intersection_over_ch.setChecked(
             self._selection.get("Intersection/Ch Signal Area", True)
         )
+        self.cb_fragmentation.setChecked(
+            self._selection.get("Fragmentation Coefficient", True)
+        )
         perch_layout.addWidget(self.cb_signal_area)
         perch_layout.addWidget(self.cb_intersection_over_ch)
+        perch_layout.addWidget(self.cb_fragmentation)
         perch_box.setLayout(perch_layout)
         layout.addWidget(perch_box)
 
@@ -539,6 +546,7 @@ class OutputSelectionDialog(QDialog):
         sel["Intersection/Ch Signal Area"] = (
             self.cb_intersection_over_ch.isChecked()
         )
+        sel["Fragmentation Coefficient"] = self.cb_fragmentation.isChecked()
 
         sel["ROI Area"] = self.cb_roi_area.isChecked()
         sel["Signal Area/ROI Area"] = self.cb_roi_area_over_ch.isChecked()
@@ -590,6 +598,7 @@ class OrganelleContactWidget(QWidget):
             "Contact Area": True,
             "Signal Area": True,
             "Intersection/Ch Signal Area": True,
+            "Fragmentation Coefficient": True,
             "ROI Area": True,
             "Signal Area/ROI Area": True,
             "Mean Intensity": True,
@@ -1832,6 +1841,25 @@ class OrganelleContactWidget(QWidget):
                 denom = int(np.sum(masks[i]))
                 out[f"Intersection/{ch_labels[i]} Signal Area"] = (
                     float(inter_n / denom) if denom > 0 else 0.0
+                )
+
+        if self.output_selection.get("Fragmentation Coefficient", True):
+            # Connected-component count of each channel's thresholded
+            # mask ("bodies" of signal), then signal area / body count
+            # as an estimate of average body size -- lower values mean
+            # more, smaller fragments (more fragmented/reticular);
+            # higher values mean fewer, larger contiguous bodies.
+            # Uses face-connectivity only (scipy.ndimage.label's default
+            # structure), i.e. 4-connected in 2D / 6-connected in 3D, so
+            # diagonally-touching pixels/voxels count as separate bodies.
+            for i in range(n):
+                signal_area = int(np.sum(masks[i]))
+                _, n_bodies = ndi_label(masks[i])
+                out[f"Body Count ({ch_labels[i]})"] = int(n_bodies)
+                out[f"Fragmentation Coefficient ({ch_labels[i]})"] = (
+                    float(signal_area / n_bodies)
+                    if n_bodies > 0
+                    else 0.0
                 )
 
         if roi_area is not None and self.output_selection.get(
