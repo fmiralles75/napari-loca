@@ -428,7 +428,8 @@ class OutputSelectionDialog(QDialog):
             "Intersection / Channel Signal Area (per channel)"
         )
         self.cb_fragmentation = QCheckBox(
-            "Fragmentation Coefficient / Body Count (per channel)"
+            "Body Count / Average Area per Body / Fragmentation "
+            "Coefficient (per channel)"
         )
         self.cb_signal_area.setChecked(
             self._selection.get("Signal Area", True)
@@ -437,7 +438,7 @@ class OutputSelectionDialog(QDialog):
             self._selection.get("Intersection/Ch Signal Area", True)
         )
         self.cb_fragmentation.setChecked(
-            self._selection.get("Fragmentation Coefficient", True)
+            self._selection.get("Fragmentation Metrics", True)
         )
         perch_layout.addWidget(self.cb_signal_area)
         perch_layout.addWidget(self.cb_intersection_over_ch)
@@ -546,7 +547,7 @@ class OutputSelectionDialog(QDialog):
         sel["Intersection/Ch Signal Area"] = (
             self.cb_intersection_over_ch.isChecked()
         )
-        sel["Fragmentation Coefficient"] = self.cb_fragmentation.isChecked()
+        sel["Fragmentation Metrics"] = self.cb_fragmentation.isChecked()
 
         sel["ROI Area"] = self.cb_roi_area.isChecked()
         sel["Signal Area/ROI Area"] = self.cb_roi_area_over_ch.isChecked()
@@ -598,7 +599,7 @@ class OrganelleContactWidget(QWidget):
             "Contact Area": True,
             "Signal Area": True,
             "Intersection/Ch Signal Area": True,
-            "Fragmentation Coefficient": True,
+            "Fragmentation Metrics": True,
             "ROI Area": True,
             "Signal Area/ROI Area": True,
             "Mean Intensity": True,
@@ -1843,23 +1844,42 @@ class OrganelleContactWidget(QWidget):
                     float(inter_n / denom) if denom > 0 else 0.0
                 )
 
-        if self.output_selection.get("Fragmentation Coefficient", True):
+        if self.output_selection.get("Fragmentation Metrics", True):
             # Connected-component count of each channel's thresholded
-            # mask ("bodies" of signal), then signal area / body count
-            # as an estimate of average body size -- lower values mean
-            # more, smaller fragments (more fragmented/reticular);
-            # higher values mean fewer, larger contiguous bodies.
-            # Uses face-connectivity only (scipy.ndimage.label's default
-            # structure), i.e. 4-connected in 2D / 6-connected in 3D, so
-            # diagonally-touching pixels/voxels count as separate bodies.
+            # mask ("bodies" of signal). Uses face-connectivity only
+            # (scipy.ndimage.label's default structure), i.e.
+            # 4-connected in 2D / 6-connected in 3D, so
+            # diagonally-touching pixels/voxels count as separate
+            # bodies.
+            #
+            # Average Area per Body = Signal Area / Body Count -- an
+            # estimate of average body size (units: pixels/voxels per
+            # body).
+            #
+            # Fragmentation Coefficient = Average Area per Body /
+            # Signal Area, which is algebraically just 1 / Body Count,
+            # but computed from the two metrics above per the intended
+            # definition. Units are 1/Body (unitless). A value near 1
+            # means nearly all signal sits in a single body (not
+            # fragmented); a value near 0 means the signal is spread
+            # across many bodies (highly fragmented).
             for i in range(n):
                 signal_area = int(np.sum(masks[i]))
                 _, n_bodies = ndi_label(masks[i])
-                out[f"Body Count ({ch_labels[i]})"] = int(n_bodies)
-                out[f"Fragmentation Coefficient ({ch_labels[i]})"] = (
-                    float(signal_area / n_bodies)
-                    if n_bodies > 0
+                avg_area_per_body = (
+                    float(signal_area / n_bodies) if n_bodies > 0 else 0.0
+                )
+                frag_coef = (
+                    float(avg_area_per_body / signal_area)
+                    if signal_area > 0
                     else 0.0
+                )
+                out[f"Body Count ({ch_labels[i]})"] = int(n_bodies)
+                out[f"Average Area per Body ({ch_labels[i]})"] = (
+                    avg_area_per_body
+                )
+                out[f"Fragmentation Coefficient ({ch_labels[i]})"] = (
+                    frag_coef
                 )
 
         if roi_area is not None and self.output_selection.get(
