@@ -227,6 +227,19 @@ means it's spread across many bodies.</p>
 "Auto-show body label layers" checkbox) displays exactly the
 connected-component groupings these three metrics are computed from,
 as a color-coded Labels layer &mdash; each body gets its own color.</p>
+<p><i>Minimum Body Size:</i> thresholded masks often leave behind
+single-pixel noise, which would otherwise be counted as its own
+"body." The Minimum Body Size spinbox (default 2 px/voxels) excludes
+any connected component smaller than that. "Apply to Body analyses"
+(on by default) scopes this to Body Count / Average Area per Body /
+Fragmentation Coefficient and the Body Labels layer only &mdash;
+Signal Area, Intersection, Union, and Contact Area are unaffected.
+"Also apply to thresholded mask" (off by default) instead removes
+small bodies from each channel's mask before anything is computed,
+so it changes every downstream metric. When only the first toggle is
+on, Average Area per Body and Fragmentation Coefficient are computed
+from the filtered signal area (the surviving bodies' combined size),
+not the full Signal Area, so the two stay internally consistent.</p>
 
 <h3>Per-ROI Area Metrics</h3>
 <p><b>ROI Area</b> &mdash; pixel count of the ROI (or the full image,
@@ -1083,6 +1096,50 @@ class OrganelleContactWidget(QWidget):
             )
             self.show_body_labels_btns.append(b)
 
+        self.min_body_size_label = QLabel("Minimum Body Size (px):")
+        self.min_body_size_spinbox = QSpinBox()
+        self.min_body_size_spinbox.setMinimum(1)
+        self.min_body_size_spinbox.setMaximum(100000)
+        self.min_body_size_spinbox.setValue(2)
+        self.min_body_size_spinbox.setToolTip(
+            "Connected components smaller than this many pixels/voxels "
+            "are treated as noise (e.g. leftover single-pixel islands) "
+            "and excluded from body counting, per the toggles below."
+        )
+        self.min_body_size_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        self.filter_body_metrics_checkbox = QCheckBox(
+            "Apply to Body analyses"
+        )
+        self.filter_body_metrics_checkbox.setToolTip(
+            "Exclude bodies smaller than the Minimum Body Size from Body "
+            "Count, Average Area per Body, and Fragmentation "
+            "Coefficient (and from the Body Labels layer), without "
+            "changing Signal Area, Intersection, Union, Contact Area, "
+            "or any other metric."
+        )
+        self.filter_body_metrics_checkbox.setChecked(True)
+        self.filter_body_metrics_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        self.filter_threshold_mask_checkbox = QCheckBox(
+            "Also apply to thresholded mask"
+        )
+        self.filter_threshold_mask_checkbox.setToolTip(
+            "Remove bodies smaller than the Minimum Body Size from each "
+            "channel's thresholded mask itself, before any metric is "
+            "computed. This changes Signal Area, Intersection, Union, "
+            "Contact Area, Mean Intensity, and every other downstream "
+            "metric -- not just the Body analyses."
+        )
+        self.filter_threshold_mask_checkbox.setChecked(False)
+        self.filter_threshold_mask_checkbox.stateChanged.connect(
+            self._on_filter_threshold_mask_changed
+        )
+
         self.show_contacts_button = QPushButton("Show Contacts")
         self.show_contacts_button.clicked.connect(self.show_contacts)
 
@@ -1091,6 +1148,7 @@ class OrganelleContactWidget(QWidget):
         self.init_ui()
         self._load_settings()
         self._sync_thresh_mode_states()
+        self._on_filter_threshold_mask_changed()
         self._refresh_channel_labels()
         self._update_z_range_controls(force_full_reset=True)
         self._auto_set_scale_bar_unit_from_layer()
@@ -1181,6 +1239,15 @@ class OrganelleContactWidget(QWidget):
         for i, b in enumerate(self.show_body_labels_btns):
             body_btn_layout.addWidget(b, i // 2, i % 2)
         thresh_group_layout.addLayout(body_btn_layout)
+
+        min_size_layout = QHBoxLayout()
+        min_size_layout.addWidget(self.min_body_size_label)
+        min_size_layout.addWidget(self.min_body_size_spinbox)
+        min_size_layout.addStretch(1)
+        thresh_group_layout.addLayout(min_size_layout)
+        thresh_group_layout.addWidget(self.filter_body_metrics_checkbox)
+        thresh_group_layout.addWidget(self.filter_threshold_mask_checkbox)
+
         layout.addWidget(self._group_box("Thresholding", thresh_group_layout))
 
         # --- ROI Tools ---
@@ -1298,6 +1365,17 @@ class OrganelleContactWidget(QWidget):
         for i in range(self.max_channels_supported):
             self.per_channel_row_widgets[i].setEnabled(i < n)
 
+    def _on_filter_threshold_mask_changed(self, _state=None):
+        """When the thresholded mask itself is already being filtered
+        (the more aggressive toggle), the scoped "Body analyses only"
+        toggle has no additional effect -- the mask body-count would
+        read from is already clean. Gray it out rather than leave a
+        checkbox on screen that silently does nothing, matching how
+        inactive channel rows are grayed out elsewhere in this UI."""
+        global_on = self.filter_threshold_mask_checkbox.isChecked()
+        self.filter_body_metrics_checkbox.setEnabled(not global_on)
+        self._save_settings()
+
     # ---------------- Settings persistence ----------------
     def _settings_snapshot(self) -> Dict[str, Any]:
         """Everything about the current configuration that's safe to
@@ -1336,6 +1414,13 @@ class OrganelleContactWidget(QWidget):
             ),
             "show_contacts_after": (
                 self.show_contacts_after_checkbox.isChecked()
+            ),
+            "min_body_size": self.min_body_size_spinbox.value(),
+            "filter_body_metrics": (
+                self.filter_body_metrics_checkbox.isChecked()
+            ),
+            "filter_threshold_mask": (
+                self.filter_threshold_mask_checkbox.isChecked()
             ),
             "per_shape": self.per_shape_checkbox.isChecked(),
             "sequential_label": self.sequential_label_checkbox.isChecked(),
@@ -1464,6 +1549,16 @@ class OrganelleContactWidget(QWidget):
             )
             self.show_contacts_after_checkbox.setChecked(
                 bool(data.get("show_contacts_after", True))
+            )
+            if "min_body_size" in data:
+                self.min_body_size_spinbox.setValue(
+                    int(np.clip(int(data["min_body_size"]), 1, 100000))
+                )
+            self.filter_body_metrics_checkbox.setChecked(
+                bool(data.get("filter_body_metrics", True))
+            )
+            self.filter_threshold_mask_checkbox.setChecked(
+                bool(data.get("filter_threshold_mask", False))
             )
             self.per_shape_checkbox.setChecked(
                 bool(data.get("per_shape", False))
@@ -2122,6 +2217,14 @@ class OrganelleContactWidget(QWidget):
                 thresh_val = float(self.per_channel_manual[i].value())
 
             m = sig > thresh_val
+            if self.filter_threshold_mask_checkbox.isChecked():
+                # The more aggressive toggle: strip small/noise bodies
+                # out of the mask itself, before anything (Signal Area,
+                # Intersection, Union, Contact Area, Mean Intensity,
+                # Body Count, ...) is computed from it.
+                m, _, _, _ = self._filter_small_bodies(
+                    m, self.min_body_size_spinbox.value()
+                )
             masks.append(m)
             dists.append(distance_transform_edt(~m))
 
@@ -2313,6 +2416,48 @@ class OrganelleContactWidget(QWidget):
                 reg &= masks[j]
         return reg
 
+    @staticmethod
+    def _filter_small_bodies(
+        mask: np.ndarray, min_size: int
+    ) -> Tuple[np.ndarray, np.ndarray, int, int]:
+        """Label ``mask``'s connected components (bodies) and drop any
+        component smaller than ``min_size`` pixels/voxels -- typically
+        single-pixel islands left over after thresholding, which would
+        otherwise be counted as their own "body" and skew Body Count /
+        Average Area per Body / Fragmentation Coefficient.
+
+        Returns (filtered_binary_mask, filtered_labels, body_count,
+        total_area), where filtered_labels is relabeled contiguously
+        (1..body_count) over the surviving bodies only, and total_area
+        is their combined pixel/voxel count (i.e. the "filtered signal
+        area" used to keep Average Area per Body internally consistent
+        when only the scoped body-metrics filter is active)."""
+        labeled, n = ndi_label(mask)
+        if n == 0 or min_size <= 1:
+            # Nothing to filter: a size-1 (or looser) cutoff keeps every
+            # non-empty body, including single pixels, so skip the
+            # extra relabeling pass.
+            return (
+                mask.astype(bool),
+                labeled,
+                int(n),
+                int(np.sum(mask)),
+            )
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0  # background is never a "body"
+        keep = sizes >= min_size
+        filtered_binary = keep[labeled] & mask.astype(bool)
+        if np.any(filtered_binary):
+            relabeled, n_kept = ndi_label(filtered_binary)
+        else:
+            relabeled, n_kept = np.zeros_like(labeled), 0
+        return (
+            filtered_binary,
+            relabeled,
+            int(n_kept),
+            int(np.sum(filtered_binary)),
+        )
+
     def _compute_metrics_bundle(
         self,
         raw_signals: List[np.ndarray],
@@ -2377,9 +2522,30 @@ class OrganelleContactWidget(QWidget):
             # means nearly all signal sits in a single body (not
             # fragmented); a value near 0 means the signal is spread
             # across many bodies (highly fragmented).
+            #
+            # If either the "Apply to Body analyses" or "Also apply to
+            # thresholded mask" toggle is on, bodies smaller than the
+            # Minimum Body Size (default 2 px/voxels) are excluded from
+            # Body Count -- and, so Average Area per Body / Fragmentation
+            # Coefficient stay internally consistent with that count,
+            # ``signal_area`` here is the *filtered* signal area (the
+            # combined size of the surviving bodies only), not the raw
+            # Signal Area reported elsewhere. When the mask itself was
+            # already filtered upstream (the "thresholded mask" toggle),
+            # this is a no-op: masks[i] is already clean.
+            apply_body_filter = (
+                self.filter_body_metrics_checkbox.isChecked()
+                or self.filter_threshold_mask_checkbox.isChecked()
+            )
+            min_body_size = self.min_body_size_spinbox.value()
             for i in range(n):
-                signal_area = int(np.sum(masks[i]))
-                _, n_bodies = ndi_label(masks[i])
+                if apply_body_filter:
+                    _, _, n_bodies, signal_area = self._filter_small_bodies(
+                        masks[i], min_body_size
+                    )
+                else:
+                    signal_area = int(np.sum(masks[i]))
+                    _, n_bodies = ndi_label(masks[i])
                 avg_area_per_body = (
                     float(signal_area / n_bodies) if n_bodies > 0 else 0.0
                 )
@@ -3061,7 +3227,21 @@ class OrganelleContactWidget(QWidget):
             print(f"Channel {ch_index+1} is not active for current analysis.")
             return
 
-        labeled, n_bodies = ndi_label(self.last_masks[ch_index])
+        apply_body_filter = (
+            self.filter_body_metrics_checkbox.isChecked()
+            or self.filter_threshold_mask_checkbox.isChecked()
+        )
+        if apply_body_filter:
+            # Match whatever's actually being counted: exclude the same
+            # small/noise bodies from the layer that the Minimum Body
+            # Size filter excludes from Body Count. (When the
+            # thresholded-mask toggle is on, last_masks[ch_index] is
+            # already filtered, so this is a harmless no-op re-check.)
+            _, labeled, n_bodies, _ = self._filter_small_bodies(
+                self.last_masks[ch_index], self.min_body_size_spinbox.value()
+            )
+        else:
+            labeled, n_bodies = ndi_label(self.last_masks[ch_index])
         layer_name = (
             f"Body Labels ({self.get_channel_labels()[ch_index]})"
             if self.use_layer_names_checkbox.isChecked()
