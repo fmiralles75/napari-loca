@@ -223,6 +223,10 @@ of those connected components (Signal Area / Body Count).</p>
 per Body divided by Signal Area (equivalent to 1/Body Count). Near 1
 means the channel's signal is essentially one contiguous body; near 0
 means it's spread across many bodies.</p>
+<p><i>Tip:</i> in the Thresholding section, "Bodies Ch N" (or the
+"Auto-show body label layers" checkbox) displays exactly the
+connected-component groupings these three metrics are computed from,
+as a color-coded Labels layer &mdash; each body gets its own color.</p>
 
 <h3>Per-ROI Area Metrics</h3>
 <p><b>ROI Area</b> &mdash; pixel count of the ROI (or the full image,
@@ -943,6 +947,23 @@ class OrganelleContactWidget(QWidget):
             lambda _: self._save_settings()
         )
 
+        self.show_body_labels_after_checkbox = QCheckBox(
+            "Auto-show body label layers"
+        )
+        self.show_body_labels_after_checkbox.setToolTip(
+            "Automatically display, for each channel, a Labels layer "
+            "showing the individual connected-component \"bodies\" used "
+            "by the Body Count / Fragmentation Coefficient metrics, "
+            "after running Analyze."
+        )
+        self.show_body_labels_after_checkbox.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Fixed
+        )
+        self.show_body_labels_after_checkbox.setChecked(False)
+        self.show_body_labels_after_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
+
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.clicked.connect(self.analyze_contacts)
 
@@ -1050,6 +1071,18 @@ class OrganelleContactWidget(QWidget):
             )
             self.show_thresh_btns.append(b)
 
+        self.show_body_labels_btns: List[QPushButton] = []
+        for i in range(self.max_channels_supported):
+            b = QPushButton(f"Bodies Ch {i+1}")
+            b.setToolTip(
+                f"Show the Body Count/Fragmentation \"bodies\" for "
+                f"Channel {i+1} as a color-coded Labels layer"
+            )
+            b.clicked.connect(
+                lambda _, idx=i: self.show_body_labels_channel(idx)
+            )
+            self.show_body_labels_btns.append(b)
+
         self.show_contacts_button = QPushButton("Show Contacts")
         self.show_contacts_button.clicked.connect(self.show_contacts)
 
@@ -1143,6 +1176,11 @@ class OrganelleContactWidget(QWidget):
         for i, b in enumerate(self.show_thresh_btns):
             thresh_btn_layout.addWidget(b, i // 2, i % 2)
         thresh_group_layout.addLayout(thresh_btn_layout)
+        thresh_group_layout.addWidget(self.show_body_labels_after_checkbox)
+        body_btn_layout = QGridLayout()
+        for i, b in enumerate(self.show_body_labels_btns):
+            body_btn_layout.addWidget(b, i // 2, i % 2)
+        thresh_group_layout.addLayout(body_btn_layout)
         layout.addWidget(self._group_box("Thresholding", thresh_group_layout))
 
         # --- ROI Tools ---
@@ -1293,6 +1331,9 @@ class OrganelleContactWidget(QWidget):
             "restrict_signal_z": self.restrict_signal_z_checkbox.isChecked(),
             "restrict_signal_z_channels": self.restrict_signal_z_channels,
             "show_thresh_after": self.show_thresh_after_checkbox.isChecked(),
+            "show_body_labels_after": (
+                self.show_body_labels_after_checkbox.isChecked()
+            ),
             "show_contacts_after": (
                 self.show_contacts_after_checkbox.isChecked()
             ),
@@ -1417,6 +1458,9 @@ class OrganelleContactWidget(QWidget):
             )
             self.show_thresh_after_checkbox.setChecked(
                 bool(data.get("show_thresh_after", False))
+            )
+            self.show_body_labels_after_checkbox.setChecked(
+                bool(data.get("show_body_labels_after", False))
             )
             self.show_contacts_after_checkbox.setChecked(
                 bool(data.get("show_contacts_after", True))
@@ -2237,6 +2281,10 @@ class OrganelleContactWidget(QWidget):
             for i in range(n):
                 self.show_thresholded_channel(i)
 
+        if self.show_body_labels_after_checkbox.isChecked():
+            for i in range(n):
+                self.show_body_labels_channel(i)
+
         if self.show_contacts_after_checkbox.isChecked():
             self._update_contacts_layer(contacts_display, base_layer)
 
@@ -2995,6 +3043,66 @@ class OrganelleContactWidget(QWidget):
                 translate=layer_translate,
             )
         print(f"Displayed thresholded image for channel {ch_index + 1}.")
+
+    def show_body_labels_channel(self, ch_index: int):
+        """Show a Labels layer where every separate connected component
+        ("body") of the channel's thresholded mask gets its own integer
+        label -- and, via napari's default Labels colormap, its own
+        distinct color. This is exactly the grouping the Body Count /
+        Average Area per Body / Fragmentation Coefficient metrics are
+        computed from, made visible so it can be visually spot-checked."""
+        if not hasattr(self, "last_masks") or not self.last_masks:
+            print(
+                "No thresholded data available. Please run an analysis first."
+            )
+            return
+        n = self._get_active_channel_count()
+        if ch_index >= n:
+            print(f"Channel {ch_index+1} is not active for current analysis.")
+            return
+
+        labeled, n_bodies = ndi_label(self.last_masks[ch_index])
+        layer_name = (
+            f"Body Labels ({self.get_channel_labels()[ch_index]})"
+            if self.use_layer_names_checkbox.isChecked()
+            else f"Body Labels Ch {ch_index+1}"
+        )
+
+        layers = self._get_image_layers()
+        base_layer = (
+            layers[self.channel_layer_indices[0]]
+            if layers
+            else self.viewer.layers[0]
+        )
+
+        layer_scale = (
+            self._last_display_scale
+            if self._last_display_scale is not None
+            else base_layer.scale
+        )
+        layer_translate = (
+            self._last_display_z_translate
+            if self._last_display_z_translate is not None
+            else base_layer.translate
+        )
+
+        if layer_name in self.viewer.layers:
+            lyr = self.viewer.layers[layer_name]
+            lyr.data = labeled
+            lyr.scale = layer_scale
+            lyr.translate = layer_translate
+        else:
+            self.viewer.add_labels(
+                labeled,
+                name=layer_name,
+                opacity=0.75,
+                scale=layer_scale,
+                translate=layer_translate,
+            )
+        print(
+            f"Displayed {n_bodies} body label(s) for channel "
+            f"{ch_index + 1}."
+        )
 
     # ---------------- ROI layer ----------------
     def toggle_roi_selection(self):
