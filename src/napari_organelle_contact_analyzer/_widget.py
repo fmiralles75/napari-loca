@@ -53,7 +53,16 @@ from qtpy.QtWidgets import (
 
 from skimage import filters
 from skimage.util import img_as_float
-from scipy.ndimage import distance_transform_edt, label as ndi_label
+from skimage.measure import regionprops
+from skimage.morphology import skeletonize
+from scipy.ndimage import (
+    distance_transform_edt,
+    label as ndi_label,
+    sum as ndi_sum,
+    maximum as ndi_maximum,
+    convolve as ndi_convolve,
+    center_of_mass as ndi_center_of_mass,
+)
 from skimage.draw import polygon
 import numpy as np
 import pandas as pd
@@ -240,6 +249,48 @@ so it changes every downstream metric. When only the first toggle is
 on, Average Area per Body and Fragmentation Coefficient are computed
 from the filtered signal area (the surviving bodies' combined size),
 not the full Signal Area, so the two stay internally consistent.</p>
+
+<h3>Morphology Metrics (per channel, opt-in)</h3>
+<p>Both Shape and Network below use the same body definition (and
+Minimum Body Size filtering, if enabled) as Fragmentation Metrics.
+Each reports two flavors: an <b>unweighted mean/SD</b> (every body
+counts once &mdash; "what does a typical object look like") and an
+<b>area-weighted mean</b> (each body counted in proportion to its own
+size &mdash; "where does most of the signal mass sit"). These can
+meaningfully disagree; that disagreement is informative, not a
+contradiction to resolve.</p>
+<p><b>Aspect Ratio</b> &mdash; major/minor axis length of each body's
+best-fit ellipse. Near 1 is circular; higher is more elongated.</p>
+<p><b>Form Factor</b> &mdash; perimeter&sup2; / (4&pi;&times;area), the
+inverse of circularity. More sensitive to branching/irregular outlines
+than Aspect Ratio alone. Not defined for 3D (Z-stack) bodies, where it
+reports as blank/NaN; Aspect Ratio still works in 3D.</p>
+<p><b>Branch Count / Junction Count / Branch Length (per body)</b>
+&mdash; from skeletonizing the mask down to a 1-pixel-wide medial axis
+and classifying each skeleton pixel by neighbor count: a junction is a
+skeleton pixel with 3 or more neighbors. Branch Length is a pixel-count
+approximation of each branch's length, not a true Euclidean path
+length.</p>
+<p><b>% Bodies with Junctions</b> &mdash; fraction of bodies (by count)
+with at least one junction, i.e. showing any branching.</p>
+<p><b>% Signal Area in Junction-Containing Bodies</b> &mdash; fraction
+of total signal area (by mass) sitting inside branched bodies, rather
+than unbranched puncta/rods.</p>
+<p><i>Caution:</i> don't treat the two percentages above as a hard
+reticular-vs-fragmented classification. MiNA's own developers
+originally reported an equivalent "number of individuals vs. number of
+networks" metric and later removed it: as a network fragments, the
+resulting pieces often each retain a junction point, so a naive
+per-object junction-presence count can rise even as the structure is
+clearly becoming more fragmented. Read these as trend indicators
+alongside Fragmentation Coefficient, not in isolation.</p>
+<p><i>Tip:</i> in the Morphology section, "Skeleton Ch N" (or the
+"Auto-show skeleton layers" checkbox) displays the skeleton (green)
+and junctions (blue) these metrics are computed from &mdash; the same
+color convention used by MiNA/Fiji's Analyze Skeleton.</p>
+<p><i>Performance:</i> both Shape and Network are off by default and
+add real computation time, especially Network on large 3D stacks,
+since skeletonization runs on the full volume.</p>
 
 <h3>Per-ROI Area Metrics</h3>
 <p><b>ROI Area</b> &mdash; pixel count of the ROI (or the full image,
@@ -573,6 +624,34 @@ class OutputSelectionDialog(QDialog):
         perch_box.setLayout(perch_layout)
         layout.addWidget(perch_box)
 
+        morph_box = QGroupBox("Morphology Metrics (per channel)")
+        morph_layout = QVBoxLayout()
+        self.cb_morph_shape = QCheckBox(
+            "Shape: Aspect Ratio / Form Factor (mean, SD, area-weighted "
+            "mean per body)"
+        )
+        self.cb_morph_network = QCheckBox(
+            "Network: Branch Count / Junction Count / Branch Length "
+            "(skeleton-based)"
+        )
+        morph_note = QLabel(
+            "Both require the body labeling used by Fragmentation "
+            "Metrics; enabling them adds noticeable computation time, "
+            "especially on large 3D stacks."
+        )
+        morph_note.setWordWrap(True)
+        self.cb_morph_shape.setChecked(
+            self._selection.get("Morphology Shape", False)
+        )
+        self.cb_morph_network.setChecked(
+            self._selection.get("Morphology Network", False)
+        )
+        morph_layout.addWidget(self.cb_morph_shape)
+        morph_layout.addWidget(self.cb_morph_network)
+        morph_layout.addWidget(morph_note)
+        morph_box.setLayout(morph_layout)
+        layout.addWidget(morph_box)
+
         roi_area_box = QGroupBox("Per-ROI Area Metrics")
         roi_area_layout = QVBoxLayout()
         self.cb_roi_area = QCheckBox("ROI Area (# pixels in ROI mask)")
@@ -676,6 +755,9 @@ class OutputSelectionDialog(QDialog):
         )
         sel["Fragmentation Metrics"] = self.cb_fragmentation.isChecked()
 
+        sel["Morphology Shape"] = self.cb_morph_shape.isChecked()
+        sel["Morphology Network"] = self.cb_morph_network.isChecked()
+
         sel["ROI Area"] = self.cb_roi_area.isChecked()
         sel["Signal Area/ROI Area"] = self.cb_roi_area_over_ch.isChecked()
 
@@ -727,6 +809,8 @@ class OrganelleContactWidget(QWidget):
             "Signal Area": True,
             "Intersection/Ch Signal Area": True,
             "Fragmentation Metrics": True,
+            "Morphology Shape": False,
+            "Morphology Network": False,
             "ROI Area": True,
             "Signal Area/ROI Area": True,
             "Mean Intensity": True,
@@ -1140,6 +1224,35 @@ class OrganelleContactWidget(QWidget):
             self._on_filter_threshold_mask_changed
         )
 
+        self.show_skeleton_btns: List[QPushButton] = []
+        for i in range(self.max_channels_supported):
+            b = QPushButton(f"Skeleton Ch {i+1}")
+            b.setToolTip(
+                f"Show the Morphology Network skeleton/junctions for "
+                f"Channel {i+1} (green skeleton, blue junctions)"
+            )
+            b.clicked.connect(
+                lambda _, idx=i: self.show_skeleton_channel(idx)
+            )
+            self.show_skeleton_btns.append(b)
+
+        self.show_skeleton_after_checkbox = QCheckBox(
+            "Auto-show skeleton layers"
+        )
+        self.show_skeleton_after_checkbox.setToolTip(
+            "Automatically display, for each channel, the skeleton/"
+            "junction layers used by the Morphology Network metrics, "
+            "after running Analyze. Requires 'Morphology Network' to "
+            "be enabled in Output Selection."
+        )
+        self.show_skeleton_after_checkbox.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Fixed
+        )
+        self.show_skeleton_after_checkbox.setChecked(False)
+        self.show_skeleton_after_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
+
         self.show_contacts_button = QPushButton("Show Contacts")
         self.show_contacts_button.clicked.connect(self.show_contacts)
 
@@ -1249,6 +1362,29 @@ class OrganelleContactWidget(QWidget):
         thresh_group_layout.addWidget(self.filter_threshold_mask_checkbox)
 
         layout.addWidget(self._group_box("Thresholding", thresh_group_layout))
+
+        # --- Morphology ---
+        # Optional, more expensive shape/network analysis (Aspect
+        # Ratio, Form Factor, Branch/Junction counts). Sits right after
+        # Thresholding since it reads the same body labeling, and
+        # before ROI Tools since it's an enrichment on the base
+        # analysis rather than a required step. Enable the actual
+        # metrics via Output Selection -> Morphology Metrics; the
+        # controls here are just for visualizing the skeleton/junctions
+        # once computed.
+        morph_group_layout = QVBoxLayout()
+        morph_note = QLabel(
+            "Enable Morphology Shape/Network metrics in Output "
+            "Selection first."
+        )
+        morph_note.setWordWrap(True)
+        morph_group_layout.addWidget(morph_note)
+        morph_group_layout.addWidget(self.show_skeleton_after_checkbox)
+        skel_btn_layout = QGridLayout()
+        for i, b in enumerate(self.show_skeleton_btns):
+            skel_btn_layout.addWidget(b, i // 2, i % 2)
+        morph_group_layout.addLayout(skel_btn_layout)
+        layout.addWidget(self._group_box("Morphology", morph_group_layout))
 
         # --- ROI Tools ---
         roi_group_layout = QVBoxLayout()
@@ -1412,6 +1548,9 @@ class OrganelleContactWidget(QWidget):
             "show_body_labels_after": (
                 self.show_body_labels_after_checkbox.isChecked()
             ),
+            "show_skeleton_after": (
+                self.show_skeleton_after_checkbox.isChecked()
+            ),
             "show_contacts_after": (
                 self.show_contacts_after_checkbox.isChecked()
             ),
@@ -1546,6 +1685,9 @@ class OrganelleContactWidget(QWidget):
             )
             self.show_body_labels_after_checkbox.setChecked(
                 bool(data.get("show_body_labels_after", False))
+            )
+            self.show_skeleton_after_checkbox.setChecked(
+                bool(data.get("show_skeleton_after", False))
             )
             self.show_contacts_after_checkbox.setChecked(
                 bool(data.get("show_contacts_after", True))
@@ -2388,6 +2530,10 @@ class OrganelleContactWidget(QWidget):
             for i in range(n):
                 self.show_body_labels_channel(i)
 
+        if self.show_skeleton_after_checkbox.isChecked():
+            for i in range(n):
+                self.show_skeleton_channel(i)
+
         if self.show_contacts_after_checkbox.isChecked():
             self._update_contacts_layer(contacts_display, base_layer)
 
@@ -2457,6 +2603,79 @@ class OrganelleContactWidget(QWidget):
             int(n_kept),
             int(np.sum(filtered_binary)),
         )
+
+    def _labeled_bodies_for_metrics(
+        self, mask: np.ndarray
+    ) -> Tuple[np.ndarray, int, int, np.ndarray]:
+        """Label ``mask`` into bodies, applying the Minimum Body Size
+        filter if either the "Apply to Body analyses" or "Also apply to
+        thresholded mask" toggle is on -- the same logic Fragmentation
+        Metrics uses, factored out here so every body-derived metric
+        (Fragmentation, Morphology Shape, Morphology Network) shares one
+        consistent definition of "a body". Returns (labels, body_count,
+        signal_area, binary_mask): ``labels`` is contiguous (1..body_count)
+        and ``binary_mask``/``signal_area`` reflect the surviving bodies
+        only."""
+        apply_body_filter = (
+            self.filter_body_metrics_checkbox.isChecked()
+            or self.filter_threshold_mask_checkbox.isChecked()
+        )
+        if apply_body_filter:
+            binary, labels, n_bodies, signal_area = self._filter_small_bodies(
+                mask, self.min_body_size_spinbox.value()
+            )
+        else:
+            binary = mask.astype(bool)
+            labels, n_bodies = ndi_label(mask)
+            signal_area = int(np.sum(mask))
+        return labels, int(n_bodies), int(signal_area), binary
+
+    @staticmethod
+    def _skeleton_and_junctions(
+        binary_mask: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Skeletonize ``binary_mask`` to a 1-pixel-wide medial axis,
+        then classify skeleton pixels by neighbor count *within the
+        skeleton*, using full/diagonal connectivity (deliberately
+        denser than the face-only connectivity used for body labeling,
+        since a thinned skeleton can zigzag diagonally and a junction
+        can be missed under face-only connectivity): >=3 neighbors
+        marks a junction/branch point. Returns (skeleton, junction_mask)
+        -- both boolean arrays the same shape as ``binary_mask``. Shared
+        by the Morphology Network metrics and the Skeleton layer
+        visualization, so what's counted and what's displayed always
+        match."""
+        skel = skeletonize(binary_mask)
+        if not np.any(skel):
+            return skel, np.zeros_like(skel, dtype=bool)
+        ndim = skel.ndim
+        struct = np.ones((3,) * ndim, dtype=int)
+        struct[tuple(1 for _ in range(ndim))] = 0
+        neighbor_count = ndi_convolve(
+            skel.astype(np.uint8), struct, mode="constant", cval=0
+        )
+        junction_mask = skel & (neighbor_count >= 3)
+        return skel, junction_mask
+
+    @staticmethod
+    def _mean_sd_wmean(
+        values: List[float], weights: List[float]
+    ) -> Tuple[float, float, float]:
+        """Given a list of per-body values (e.g. Aspect Ratio, Branch
+        Count) and matching per-body weights (area/volume), return
+        (unweighted mean, unweighted SD, area-weighted mean). Every body
+        counts once for the first two; the third scales each body's
+        contribution by its own size. Returns (0.0, 0.0, 0.0) if
+        ``values`` is empty (e.g. no surviving bodies)."""
+        if len(values) == 0:
+            return 0.0, 0.0, 0.0
+        arr = np.asarray(values, dtype=float)
+        w = np.asarray(weights, dtype=float)
+        mean = float(np.mean(arr))
+        sd = float(np.std(arr))
+        wsum = float(np.sum(w))
+        wmean = float(np.sum(arr * w) / wsum) if wsum > 0 else mean
+        return mean, sd, wmean
 
     def _compute_metrics_bundle(
         self,
@@ -2533,19 +2752,10 @@ class OrganelleContactWidget(QWidget):
             # Signal Area reported elsewhere. When the mask itself was
             # already filtered upstream (the "thresholded mask" toggle),
             # this is a no-op: masks[i] is already clean.
-            apply_body_filter = (
-                self.filter_body_metrics_checkbox.isChecked()
-                or self.filter_threshold_mask_checkbox.isChecked()
-            )
-            min_body_size = self.min_body_size_spinbox.value()
             for i in range(n):
-                if apply_body_filter:
-                    _, _, n_bodies, signal_area = self._filter_small_bodies(
-                        masks[i], min_body_size
-                    )
-                else:
-                    signal_area = int(np.sum(masks[i]))
-                    _, n_bodies = ndi_label(masks[i])
+                _, n_bodies, signal_area, _ = self._labeled_bodies_for_metrics(
+                    masks[i]
+                )
                 avg_area_per_body = (
                     float(signal_area / n_bodies) if n_bodies > 0 else 0.0
                 )
@@ -2561,6 +2771,266 @@ class OrganelleContactWidget(QWidget):
                 out[f"Fragmentation Coefficient ({ch_labels[i]})"] = (
                     frag_coef
                 )
+
+        if self.output_selection.get("Morphology Shape", False):
+            # Per-body shape descriptors via skimage.measure.regionprops,
+            # computed once per channel (vectorized across every body,
+            # not a per-body Python loop). Aspect Ratio = major/minor
+            # axis length of each body's best-fit ellipse (the
+            # Koopman et al. 2006 convention); Form Factor =
+            # perimeter^2 / (4*pi*area), the inverse of circularity --
+            # more sensitive to branching/irregularity than AR alone.
+            # Bodies use the same body definition (and Minimum Body
+            # Size filtering, if enabled) as Fragmentation Metrics.
+            #
+            # Both an unweighted mean/SD (every body counts once --
+            # "what does a typical object look like") and an
+            # area-weighted mean (each body counted in proportion to
+            # its own pixel/voxel count -- "where does most of the
+            # signal mass sit, shape-wise") are reported, since the two
+            # can meaningfully disagree; see the Metric Descriptions
+            # dialog for why that's informative rather than a
+            # contradiction.
+            #
+            # Form Factor's perimeter term is only defined by
+            # regionprops for 2D regions; on a 3D (Z-stack) analysis,
+            # Form Factor is reported as NaN rather than a misleading
+            # 0.0, while Aspect Ratio (based on the 3D inertia tensor)
+            # still works normally.
+            for i in range(n):
+                labels_i, n_bodies_i, _, _ = self._labeled_bodies_for_metrics(
+                    masks[i]
+                )
+                ar_vals: List[float] = []
+                ff_vals: List[float] = []
+                ar_areas: List[float] = []
+                ff_areas: List[float] = []
+                if n_bodies_i > 0:
+                    try:
+                        for rp in regionprops(labels_i):
+                            area_i = float(rp.area)
+                            try:
+                                major = getattr(
+                                    rp, "axis_major_length",
+                                    getattr(rp, "major_axis_length", None),
+                                )
+                                minor = getattr(
+                                    rp, "axis_minor_length",
+                                    getattr(rp, "minor_axis_length", None),
+                                )
+                                if major is not None and minor and minor > 0:
+                                    ar_vals.append(float(major / minor))
+                                    ar_areas.append(area_i)
+                            except Exception:
+                                pass
+                            try:
+                                perim = rp.perimeter
+                                if perim is not None and area_i > 0:
+                                    ff_vals.append(
+                                        float(
+                                            (perim ** 2)
+                                            / (4 * np.pi * area_i)
+                                        )
+                                    )
+                                    ff_areas.append(area_i)
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        print(
+                            f"Warning: Morphology Shape computation "
+                            f"failed for {ch_labels[i]}: {e}"
+                        )
+
+                ar_mean, ar_sd, ar_wmean = self._mean_sd_wmean(
+                    ar_vals, ar_areas
+                )
+                if ff_vals:
+                    ff_mean, ff_sd, ff_wmean = self._mean_sd_wmean(
+                        ff_vals, ff_areas
+                    )
+                else:
+                    ff_mean = ff_sd = ff_wmean = float("nan")
+
+                out[f"Aspect Ratio Mean ({ch_labels[i]})"] = ar_mean
+                out[f"Aspect Ratio SD ({ch_labels[i]})"] = ar_sd
+                out[f"Aspect Ratio Weighted Mean ({ch_labels[i]})"] = (
+                    ar_wmean
+                )
+                out[f"Form Factor Mean ({ch_labels[i]})"] = ff_mean
+                out[f"Form Factor SD ({ch_labels[i]})"] = ff_sd
+                out[f"Form Factor Weighted Mean ({ch_labels[i]})"] = (
+                    ff_wmean
+                )
+
+        if self.output_selection.get("Morphology Network", False):
+            # Skeleton/graph-based network descriptors. The mask is
+            # skeletonized once per channel (not per body) down to a
+            # 1-pixel-wide medial axis, then every skeleton pixel is
+            # classified by its neighbor count *within the skeleton*,
+            # using full/diagonal connectivity (deliberately denser than
+            # the face-only connectivity used for body labeling, since a
+            # thinned skeleton can zigzag diagonally and a junction can
+            # be missed under face-only connectivity): 1 neighbor =
+            # endpoint, 2 = mid-branch, >=3 = a junction/branch point.
+            #
+            # Branches are found by removing junction pixels and
+            # relabeling what's left; each surviving fragment is one
+            # branch, and its pixel count stands in for branch length
+            # (a pixel-count proxy, not a true Euclidean skeleton-path
+            # length -- see the Metric Descriptions dialog).
+            #
+            # As with Morphology Shape, both an unweighted mean (per
+            # body) and an area-weighted mean are reported, plus two
+            # reticular-fraction summaries: % of bodies with at least
+            # one junction (by object count) and % of signal area
+            # sitting in junction-containing bodies (by mass). Treat
+            # these as trend indicators, not a hard reticular/fragmented
+            # classification -- see the Metric Descriptions dialog for
+            # why a naive per-object junction-presence count can be
+            # misleading during fragmentation.
+            for i in range(n):
+                labels_i, n_bodies_i, _, binary_i = (
+                    self._labeled_bodies_for_metrics(masks[i])
+                )
+                branch_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
+                junction_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
+                branch_len_totals = np.zeros(
+                    n_bodies_i + 1, dtype=np.float64
+                )
+                body_areas = np.zeros(n_bodies_i + 1, dtype=np.float64)
+
+                if n_bodies_i > 0:
+                    try:
+                        skel, junction_mask = self._skeleton_and_junctions(
+                            binary_i
+                        )
+                        ndim = skel.ndim
+                        struct = np.ones((3,) * ndim, dtype=int)
+                        struct[tuple(1 for _ in range(ndim))] = 0
+                        branch_only = skel & ~junction_mask
+
+                        branch_labels, n_frags = ndi_label(
+                            branch_only, structure=struct
+                        )
+                        if n_frags > 0:
+                            frag_ids = np.arange(1, n_frags + 1)
+                            frag_body = ndi_maximum(
+                                labels_i, labels=branch_labels,
+                                index=frag_ids,
+                            )
+                            frag_len = ndi_sum(
+                                branch_only, labels=branch_labels,
+                                index=frag_ids,
+                            )
+                            frag_body = np.atleast_1d(frag_body).astype(int)
+                            frag_len = np.atleast_1d(frag_len)
+                            valid = (frag_body >= 1) & (
+                                frag_body <= n_bodies_i
+                            )
+                            np.add.at(
+                                branch_counts, frag_body[valid], 1.0
+                            )
+                            np.add.at(
+                                branch_len_totals,
+                                frag_body[valid],
+                                frag_len[valid],
+                            )
+
+                        if np.any(junction_mask):
+                            # A single true branch point often flags
+                            # several adjacent pixels as >=3-neighbor
+                            # (e.g. every pixel immediately touching a
+                            # 4-way junction typically also touches its
+                            # neighboring arm pixels diagonally).
+                            # Connected-component label the junction
+                            # mask itself (full/diagonal connectivity)
+                            # and count *clusters*, not raw pixels, so
+                            # one real branch point isn't counted 2-3
+                            # times.
+                            junction_clusters, n_junc = ndi_label(
+                                junction_mask, structure=struct
+                            )
+                            if n_junc > 0:
+                                junc_ids = np.arange(1, n_junc + 1)
+                                junc_body = ndi_maximum(
+                                    labels_i, labels=junction_clusters,
+                                    index=junc_ids,
+                                )
+                                junc_body = np.atleast_1d(
+                                    junc_body
+                                ).astype(int)
+                                jvalid = (junc_body >= 1) & (
+                                    junc_body <= n_bodies_i
+                                )
+                                np.add.at(
+                                    junction_counts,
+                                    junc_body[jvalid],
+                                    1.0,
+                                )
+
+                        areas_full = np.bincount(
+                            labels_i.ravel(), minlength=n_bodies_i + 1
+                        )
+                        body_areas[: len(areas_full)] = areas_full
+                    except Exception as e:
+                        print(
+                            f"Warning: Morphology Network computation "
+                            f"failed for {ch_labels[i]}: {e}"
+                        )
+
+                b_counts = branch_counts[1 : n_bodies_i + 1]
+                j_counts = junction_counts[1 : n_bodies_i + 1]
+                b_len_totals = branch_len_totals[1 : n_bodies_i + 1]
+                b_areas = body_areas[1 : n_bodies_i + 1]
+
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    mean_branch_len_per_body = np.where(
+                        b_counts > 0, b_len_totals / b_counts, 0.0
+                    )
+
+                bc_mean, _, bc_wmean = self._mean_sd_wmean(
+                    list(b_counts), list(b_areas)
+                )
+                jc_mean, _, jc_wmean = self._mean_sd_wmean(
+                    list(j_counts), list(b_areas)
+                )
+                bl_mean, _, bl_wmean = self._mean_sd_wmean(
+                    list(mean_branch_len_per_body), list(b_areas)
+                )
+
+                pct_bodies_with_junction = (
+                    float(np.sum(j_counts > 0) / n_bodies_i * 100.0)
+                    if n_bodies_i > 0
+                    else 0.0
+                )
+                total_area = float(np.sum(b_areas))
+                pct_area_with_junction = (
+                    float(
+                        np.sum(b_areas[j_counts > 0]) / total_area * 100.0
+                    )
+                    if total_area > 0
+                    else 0.0
+                )
+
+                out[f"Branch Count Mean ({ch_labels[i]})"] = bc_mean
+                out[f"Branch Count Weighted Mean ({ch_labels[i]})"] = (
+                    bc_wmean
+                )
+                out[f"Junction Count Mean ({ch_labels[i]})"] = jc_mean
+                out[f"Junction Count Weighted Mean ({ch_labels[i]})"] = (
+                    jc_wmean
+                )
+                out[f"Branch Length Mean ({ch_labels[i]})"] = bl_mean
+                out[f"Branch Length Weighted Mean ({ch_labels[i]})"] = (
+                    bl_wmean
+                )
+                out[f"% Bodies with Junctions ({ch_labels[i]})"] = (
+                    pct_bodies_with_junction
+                )
+                out[
+                    f"% Signal Area in Junction-Containing Bodies "
+                    f"({ch_labels[i]})"
+                ] = pct_area_with_junction
 
         if roi_area is not None and self.output_selection.get(
             "ROI Area", True
@@ -3227,21 +3697,12 @@ class OrganelleContactWidget(QWidget):
             print(f"Channel {ch_index+1} is not active for current analysis.")
             return
 
-        apply_body_filter = (
-            self.filter_body_metrics_checkbox.isChecked()
-            or self.filter_threshold_mask_checkbox.isChecked()
+        # Match whatever's actually being counted: exclude the same
+        # small/noise bodies from the layer that the Minimum Body Size
+        # filter excludes from Body Count.
+        labeled, n_bodies, _, _ = self._labeled_bodies_for_metrics(
+            self.last_masks[ch_index]
         )
-        if apply_body_filter:
-            # Match whatever's actually being counted: exclude the same
-            # small/noise bodies from the layer that the Minimum Body
-            # Size filter excludes from Body Count. (When the
-            # thresholded-mask toggle is on, last_masks[ch_index] is
-            # already filtered, so this is a harmless no-op re-check.)
-            _, labeled, n_bodies, _ = self._filter_small_bodies(
-                self.last_masks[ch_index], self.min_body_size_spinbox.value()
-            )
-        else:
-            labeled, n_bodies = ndi_label(self.last_masks[ch_index])
         layer_name = (
             f"Body Labels ({self.get_channel_labels()[ch_index]})"
             if self.use_layer_names_checkbox.isChecked()
@@ -3281,6 +3742,134 @@ class OrganelleContactWidget(QWidget):
             )
         print(
             f"Displayed {n_bodies} body label(s) for channel "
+            f"{ch_index + 1}."
+        )
+
+    def show_skeleton_channel(self, ch_index: int):
+        """Show the skeleton/junction layers the Morphology Network
+        metrics (Branch Count, Junction Count, Branch Length, %
+        reticular fractions) are computed from: a green skeleton
+        overlay and a blue junction-point layer, matching the color
+        convention used by MiNA/Fiji's Analyze Skeleton so the overlay
+        reads intuitively for anyone used to that tool."""
+        if not hasattr(self, "last_masks") or not self.last_masks:
+            print(
+                "No thresholded data available. Please run an analysis first."
+            )
+            return
+        n = self._get_active_channel_count()
+        if ch_index >= n:
+            print(f"Channel {ch_index+1} is not active for current analysis.")
+            return
+
+        _, n_bodies, _, binary = self._labeled_bodies_for_metrics(
+            self.last_masks[ch_index]
+        )
+        if n_bodies == 0:
+            print(f"No bodies to skeletonize for channel {ch_index + 1}.")
+            return
+
+        try:
+            skel, junction_mask = self._skeleton_and_junctions(binary)
+        except Exception as e:
+            print(f"Warning: skeletonization failed: {e}")
+            return
+
+        ch_label = self.get_channel_labels()[ch_index]
+        skel_name = (
+            f"Skeleton ({ch_label})"
+            if self.use_layer_names_checkbox.isChecked()
+            else f"Skeleton Ch {ch_index+1}"
+        )
+        junction_name = (
+            f"Junctions ({ch_label})"
+            if self.use_layer_names_checkbox.isChecked()
+            else f"Junctions Ch {ch_index+1}"
+        )
+
+        layers = self._get_image_layers()
+        base_layer = (
+            layers[self.channel_layer_indices[0]]
+            if layers
+            else self.viewer.layers[0]
+        )
+        layer_scale = (
+            self._last_display_scale
+            if self._last_display_scale is not None
+            else base_layer.scale
+        )
+        layer_translate = (
+            self._last_display_z_translate
+            if self._last_display_z_translate is not None
+            else base_layer.translate
+        )
+
+        skel_data = skel.astype(float)
+        if skel_name in self.viewer.layers:
+            lyr = self.viewer.layers[skel_name]
+            lyr.data = skel_data
+            lyr.scale = layer_scale
+            lyr.translate = layer_translate
+        else:
+            self.viewer.add_image(
+                skel_data,
+                name=skel_name,
+                colormap="green",
+                blending="additive",
+                opacity=0.9,
+                scale=layer_scale,
+                translate=layer_translate,
+            )
+
+        # One point per junction *cluster* (its centroid), not per raw
+        # flagged pixel -- a single true branch point often flags
+        # several adjacent pixels, and plotting each separately would
+        # both look noisy and misrepresent the Junction Count metric,
+        # which counts clusters the same way.
+        junction_coords = np.zeros((0, junction_mask.ndim), dtype=float)
+        if np.any(junction_mask):
+            jndim = junction_mask.ndim
+            jstruct = np.ones((3,) * jndim, dtype=int)
+            jstruct[tuple(1 for _ in range(jndim))] = 0
+            junction_clusters, n_junc = ndi_label(
+                junction_mask, structure=jstruct
+            )
+            if n_junc > 0:
+                centroids = ndi_center_of_mass(
+                    junction_mask,
+                    labels=junction_clusters,
+                    index=np.arange(1, n_junc + 1),
+                )
+                junction_coords = np.atleast_2d(np.asarray(centroids))
+
+        if junction_coords.size and layer_scale is not None:
+            scale_arr = np.asarray(layer_scale)
+            if scale_arr.shape[0] == junction_coords.shape[1]:
+                junction_coords_world = junction_coords * scale_arr
+                if layer_translate is not None:
+                    junction_coords_world = (
+                        junction_coords_world + np.asarray(layer_translate)
+                    )
+            else:
+                junction_coords_world = junction_coords
+        else:
+            junction_coords_world = junction_coords
+
+        if junction_name in self.viewer.layers:
+            lyr = self.viewer.layers[junction_name]
+            lyr.data = junction_coords_world
+        else:
+            self.viewer.add_points(
+                junction_coords_world,
+                name=junction_name,
+                face_color="blue",
+                size=6,
+                opacity=0.9,
+            )
+
+        print(
+            f"Displayed skeleton ({int(skel.sum())} px) and "
+            f"{junction_coords.shape[0]} junction(s) for channel "
             f"{ch_index + 1}."
         )
 
