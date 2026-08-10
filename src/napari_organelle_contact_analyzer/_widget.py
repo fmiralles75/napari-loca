@@ -217,6 +217,18 @@ index of the two above, a normalized 0-1 overlap score.</p>
 <p><b>Contact Area</b> &mdash; pixel count where a channel's signal sits
 within the Contact Threshold distance of every other channel's signal
 (a distance-tolerant version of intersection, not a strict AND).</p>
+<p><i>Z/XY calibration:</i> on a Z-stack, "Threshold (px)" still means
+pixels of lateral (XY) distance, but the Z axis is weighted relative
+to XY using the image's calibration (Z step / XY pixel size), so a
+step in Z isn't silently treated as the same physical distance as an
+XY pixel when the two differ -- very common in fluorescence
+microscopy. This is auto-detected from the image's own metadata when
+available (shown in the Contact Analysis section); if no calibration
+is detected, or it looks wrong, or the image wasn't opened through
+this plugin's own reader, use "Manually specify Z/XY calibration" to
+override it. With no calibration at all (detected or manual), this
+behaves exactly as before (Z and XY pixels treated as equal
+distance).</p>
 
 <h3>Per-Channel Area Metrics</h3>
 <p><b>Signal Area (per channel)</b> &mdash; pixel count of that
@@ -847,6 +859,57 @@ class OrganelleContactWidget(QWidget):
         self.ct_text.setValidator(QIntValidator(0, 100))
         self.ct_text.editingFinished.connect(self.text_input_changed)
 
+        # Z/XY voxel calibration -- corrects the Contact Threshold's
+        # proximity search so a step in Z isn't silently treated as the
+        # same physical distance as an XY pixel when the two differ
+        # (very common in Z-stack microscopy). "Threshold (px)" keeps
+        # its existing meaning for lateral distance; only the Z axis's
+        # relative weight in the 3D distance transform changes.
+        self.voxel_calibration_status_label = QLabel("")
+        self.voxel_calibration_status_label.setWordWrap(True)
+        self.manual_voxel_calibration_checkbox = QCheckBox(
+            "Manually specify Z/XY calibration"
+        )
+        self.manual_voxel_calibration_checkbox.setToolTip(
+            "Override the Z/XY pixel-size ratio auto-detected from the "
+            "image's metadata (napari layer scale). Use this if your "
+            "image has no calibration metadata, the detected values "
+            "look wrong, or the image wasn't opened through this "
+            "plugin's own reader."
+        )
+        self.manual_voxel_calibration_checkbox.setChecked(False)
+        self.manual_voxel_calibration_checkbox.stateChanged.connect(
+            self._on_voxel_calibration_changed
+        )
+
+        self.z_step_spinbox = QDoubleSpinBox()
+        self.z_step_spinbox.setDecimals(4)
+        self.z_step_spinbox.setMinimum(0.0001)
+        self.z_step_spinbox.setMaximum(10000.0)
+        self.z_step_spinbox.setValue(1.0)
+        self.z_step_spinbox.setToolTip(
+            "Z step size (distance between slices), any consistent "
+            "physical unit -- only the ratio to XY pixel size matters."
+        )
+        self.z_step_spinbox.setEnabled(False)
+        self.z_step_spinbox.valueChanged.connect(
+            lambda _: self._on_voxel_calibration_changed()
+        )
+
+        self.xy_pixel_spinbox = QDoubleSpinBox()
+        self.xy_pixel_spinbox.setDecimals(4)
+        self.xy_pixel_spinbox.setMinimum(0.0001)
+        self.xy_pixel_spinbox.setMaximum(10000.0)
+        self.xy_pixel_spinbox.setValue(1.0)
+        self.xy_pixel_spinbox.setToolTip(
+            "XY pixel size, in the same physical unit as the Z step "
+            "size above."
+        )
+        self.xy_pixel_spinbox.setEnabled(False)
+        self.xy_pixel_spinbox.valueChanged.connect(
+            lambda _: self._on_voxel_calibration_changed()
+        )
+
         self.channels_label = QLabel("Channels:")
         self.channel_mode_combo = QComboBox()
         self.channel_mode_combo.addItems(["2", "3", "4"])
@@ -1266,6 +1329,7 @@ class OrganelleContactWidget(QWidget):
         self._update_z_range_controls(force_full_reset=True)
         self._auto_set_scale_bar_unit_from_layer()
         self._update_scale_bar_status_label()
+        self._on_voxel_calibration_changed()
 
     # ---------------- UI ----------------
     def _group_box(self, title: str, inner_layout) -> QGroupBox:
@@ -1406,6 +1470,18 @@ class OrganelleContactWidget(QWidget):
         ct_layout.addWidget(self.ct_slider)
         ct_layout.addWidget(self.ct_text)
         contact_group_layout.addLayout(ct_layout)
+
+        contact_group_layout.addWidget(self.voxel_calibration_status_label)
+        contact_group_layout.addWidget(
+            self.manual_voxel_calibration_checkbox
+        )
+        voxel_cal_layout = QHBoxLayout()
+        voxel_cal_layout.addWidget(QLabel("Z step:"))
+        voxel_cal_layout.addWidget(self.z_step_spinbox)
+        voxel_cal_layout.addWidget(QLabel("XY pixel:"))
+        voxel_cal_layout.addWidget(self.xy_pixel_spinbox)
+        contact_group_layout.addLayout(voxel_cal_layout)
+
         contact_group_layout.addWidget(self.analyze_button)
         contact_group_layout.addWidget(self.show_contacts_after_checkbox)
         contact_group_layout.addWidget(self.show_contacts_button)
@@ -1561,6 +1637,11 @@ class OrganelleContactWidget(QWidget):
             "filter_threshold_mask": (
                 self.filter_threshold_mask_checkbox.isChecked()
             ),
+            "manual_voxel_calibration": (
+                self.manual_voxel_calibration_checkbox.isChecked()
+            ),
+            "z_step_size": self.z_step_spinbox.value(),
+            "xy_pixel_size": self.xy_pixel_spinbox.value(),
             "per_shape": self.per_shape_checkbox.isChecked(),
             "sequential_label": self.sequential_label_checkbox.isChecked(),
             "include_scale_bar_in_saved_image": (
@@ -1702,6 +1783,19 @@ class OrganelleContactWidget(QWidget):
             self.filter_threshold_mask_checkbox.setChecked(
                 bool(data.get("filter_threshold_mask", False))
             )
+            if "z_step_size" in data:
+                self.z_step_spinbox.setValue(
+                    float(np.clip(float(data["z_step_size"]), 0.0001, 10000.0))
+                )
+            if "xy_pixel_size" in data:
+                self.xy_pixel_spinbox.setValue(
+                    float(
+                        np.clip(float(data["xy_pixel_size"]), 0.0001, 10000.0)
+                    )
+                )
+            self.manual_voxel_calibration_checkbox.setChecked(
+                bool(data.get("manual_voxel_calibration", False))
+            )
             self.per_shape_checkbox.setChecked(
                 bool(data.get("per_shape", False))
             )
@@ -1762,6 +1856,77 @@ class OrganelleContactWidget(QWidget):
         self._refresh_channel_labels()
         self._update_z_range_controls(force_full_reset=False)
         self._auto_set_scale_bar_unit_from_layer()
+        self._update_voxel_calibration_status_label()
+
+    def _get_z_xy_ratio(
+        self, base_layer: Optional["napari.layers.Image"] = None
+    ) -> Tuple[float, bool, str]:
+        """Determine the Z-step / XY-pixel-size ratio to use when
+        weighting the Z axis in the Contact Threshold's distance
+        transform. Returns (ratio, is_calibrated, description):
+        ``ratio`` is 1.0 (no correction) whenever no real calibration
+        is available, so this safely degrades to today's behavior for
+        uncalibrated images. ``is_calibrated`` is False in that case,
+        so callers/labels can say so plainly rather than implying a
+        detected value of "exactly 1.0"."""
+        if self.manual_voxel_calibration_checkbox.isChecked():
+            z = float(self.z_step_spinbox.value())
+            xy = float(self.xy_pixel_spinbox.value())
+            ratio = (z / xy) if xy > 0 else 1.0
+            return (
+                ratio,
+                True,
+                f"Manual: Z={z:g} / XY={xy:g} (ratio {ratio:.3f})",
+            )
+
+        if base_layer is None:
+            base_layer = self._get_mapped_base_layer()
+        if base_layer is None:
+            return 1.0, False, "No image selected."
+
+        try:
+            data = np.asarray(base_layer.data)
+            while data.ndim > 3:
+                data = data[0]
+            if data.ndim < 3:
+                return 1.0, False, "2D image -- no Z axis to correct."
+
+            scale = np.asarray(base_layer.scale, dtype=float)
+            if scale.shape[0] < 3:
+                return 1.0, False, "No calibration detected on this layer."
+            z, y, x = scale[-3], scale[-2], scale[-1]
+            xy = float(np.mean([y, x]))
+            if z <= 0 or xy <= 0:
+                return 1.0, False, "No calibration detected on this layer."
+            if z == 1.0 and xy == 1.0:
+                # napari's default, uncalibrated scale -- not a real
+                # 1:1 physical measurement, just the absence of one.
+                return (
+                    1.0,
+                    False,
+                    "No calibration detected -- treating as isotropic "
+                    "(ratio 1.0).",
+                )
+            ratio = z / xy
+            return (
+                ratio,
+                True,
+                f"Detected from image: Z={z:g}, XY={xy:g} "
+                f"(ratio {ratio:.3f})",
+            )
+        except Exception as e:
+            return 1.0, False, f"Could not read calibration ({e})."
+
+    def _on_voxel_calibration_changed(self, _state=None):
+        manual = self.manual_voxel_calibration_checkbox.isChecked()
+        self.z_step_spinbox.setEnabled(manual)
+        self.xy_pixel_spinbox.setEnabled(manual)
+        self._update_voxel_calibration_status_label()
+        self._save_settings()
+
+    def _update_voxel_calibration_status_label(self):
+        _, _, desc = self._get_z_xy_ratio()
+        self.voxel_calibration_status_label.setText(desc)
 
     def _update_z_range_controls(self, force_full_reset: bool = False):
         base_layer = self._get_mapped_base_layer()
@@ -2343,6 +2508,14 @@ class OrganelleContactWidget(QWidget):
         dists: List[np.ndarray] = []
         keep_idx = None
 
+        # Weight the Z axis in the Contact Threshold's distance search
+        # relative to XY, so a step in Z isn't silently treated as the
+        # same physical distance as an XY pixel when the two differ
+        # (see _get_z_xy_ratio). Computed once -- it's a property of
+        # the image's calibration, not of any one channel -- and
+        # reused for every channel's distance transform below.
+        z_xy_ratio, _, _ = self._get_z_xy_ratio(base_layer)
+
         for i in range(n):
             sig = norm_signals[i]
             mode = self.per_channel_mode[i].currentText()
@@ -2368,7 +2541,10 @@ class OrganelleContactWidget(QWidget):
                     m, self.min_body_size_spinbox.value()
                 )
             masks.append(m)
-            dists.append(distance_transform_edt(~m))
+            sampling = (
+                (z_xy_ratio, 1.0, 1.0) if m.ndim == 3 else None
+            )
+            dists.append(distance_transform_edt(~m, sampling=sampling))
 
         if self.restrict_to_signal_z and masks and masks[0].ndim >= 3:
             selected_channels = self._get_default_restrict_signal_z_channels(n)
