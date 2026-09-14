@@ -18,13 +18,13 @@ import json
 import re
 import warnings
 
-from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
+from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple, Callable
 
 import napari
 from magicgui import magic_factory
 from magicgui.widgets import Container, create_widget
 from qtpy.QtGui import QIntValidator
-from qtpy.QtCore import Qt, QSettings
+from qtpy.QtCore import Qt, QSettings, QEvent, QObject
 from qtpy.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
@@ -37,6 +37,7 @@ from qtpy.QtWidgets import (
     QComboBox,
     QFileDialog,
     QDoubleSpinBox,
+    QAbstractSpinBox,
     QCheckBox,
     QScrollArea,
     QDialog,
@@ -49,6 +50,8 @@ from qtpy.QtWidgets import (
     QHeaderView,
     QSizePolicy,
     QTextEdit,
+    QProgressBar,
+    QApplication,
 )
 
 from skimage import filters
@@ -58,16 +61,21 @@ from skimage.morphology import skeletonize
 from scipy.ndimage import (
     distance_transform_edt,
     label as ndi_label,
-    sum as ndi_sum,
-    maximum as ndi_maximum,
-    convolve as ndi_convolve,
-    center_of_mass as ndi_center_of_mass,
 )
+from scipy.spatial import cKDTree
 from skimage.draw import polygon
 import numpy as np
 import pandas as pd
 import imageio.v2 as imageio
 from scipy.spatial import ConvexHull
+
+# skan builds a proper graph from a skeletonized mask -- one node per
+# true junction, correctly separated even when several true crossings
+# sit close together -- for the Morphology Network metrics. See
+# _skan_network_analysis()'s docstring for why this replaced an
+# earlier pixel-proximity clustering approach that could under-count
+# junctions in dense, tangled networks.
+from skan import Skeleton as SkanSkeleton, summarize as skan_summarize
 
 if TYPE_CHECKING:
     import napari
@@ -244,10 +252,11 @@ of those connected components (Signal Area / Body Count).</p>
 per Body divided by Signal Area (equivalent to 1/Body Count). Near 1
 means the channel's signal is essentially one contiguous body; near 0
 means it's spread across many bodies.</p>
-<p><i>Tip:</i> in the Thresholding section, "Bodies Ch N" (or the
-"Auto-show body label layers" checkbox) displays exactly the
-connected-component groupings these three metrics are computed from,
-as a color-coded Labels layer &mdash; each body gets its own color.</p>
+<p><i>Tip:</i> in the Thresholding section, "Bodies Ch N" (or "Body
+Labels" in Auto-Display Setup, under Metrics && Display Settings)
+displays exactly the connected-component groupings these three
+metrics are computed from, as a color-coded Labels layer &mdash; each
+body gets its own color.</p>
 <p><i>Minimum Body Size:</i> thresholded masks often leave behind
 single-pixel noise, which would otherwise be counted as its own
 "body." The Minimum Body Size spinbox (default 2 px/voxels) excludes
@@ -271,18 +280,165 @@ counts once &mdash; "what does a typical object look like") and an
 size &mdash; "where does most of the signal mass sit"). These can
 meaningfully disagree; that disagreement is informative, not a
 contradiction to resolve.</p>
+<p><i>Fill Holes Up To (px):</i> before either Shape or Network runs,
+small fully-enclosed background holes (e.g. thresholding noise inside
+an otherwise-solid body) up to this many pixels/voxels are filled in.
+Without this, a hole -- even a single noisy pixel -- gets its own ring
+in the skeleton and distorts Aspect Ratio/Form Factor. Larger,
+presumably real gaps are left untouched. Default is 4; set to 0 to
+disable. Body Count, Fragmentation Coefficient, and the Body Labels
+layer are never affected by this -- only Shape/Network and the
+Skeleton/Junctions visualization use the filled version.</p>
+<p><i>Prune Spurs Under (px):</i> Network only. A jagged, pixel-noisy
+mask <b>boundary</b> (as opposed to an interior hole) makes skeletonize
+trace a short spurious stub off the network for every small bump/notch
+along that edge, inflating Branch/Junction Count -- filling holes
+doesn't address this, since it's a boundary artifact, not an interior
+one. This removes any branch shorter than the given length that skan
+classifies as running from a junction to a free end (the classic spur
+shape). Branches connecting two real junctions, or a body's entire
+skeleton if it has no junctions at all, are left alone regardless of
+length. Chosen over eroding/smoothing the mask itself specifically
+because erosion risks deleting real thin branches (mitochondrial
+tubules can be only a few pixels wide); pruning only ever touches the
+skeleton, never the underlying mask, so Body Area/Aspect Ratio/Form
+Factor/Body Count are unaffected. Same units as Branch Length
+(XY-pixel-equivalent, calibration-aware in 3D). Default is 3; set to 0
+to disable.</p>
+<p><i>Collapse Bridges Under (px):</i> Network only, off by default.
+Prune Spurs removes dangling dead-end stubs; this instead handles a
+different artifact shape -- two junctions connected *to each other* by
+a very short branch, which a single irregular/wide spot on a jagged
+mask boundary can produce (skeletonize resolves it as two closely-spaced
+junctions joined by a short bridge, rather than one clean junction).
+Any junction-to-junction branch shorter than this length has its two
+junctions reported as a single merged junction instead, placed at the
+average position of the originals. Unlike Prune Spurs, this never
+touches skeleton pixels -- only what's counted: the connecting branch
+is dropped from Branch Count/Branch Length, and every other branch
+touching either junction is otherwise unaffected. Same units as Branch
+Length. 0 disables it (default).</p>
+<p><i>Collapse Wide Regions Over (px):</i> Network only, off by
+default. Fill Holes, Prune Spurs, and Collapse Bridges all correct
+skeletonize *artifacts* on a body that's genuinely filament-shaped
+throughout. This instead handles a body that's tubular in most places
+but has a locally wide, swollen/globular stretch woven into it --
+still part of the same reticular network, not a separate blob --
+where skeletonizing that stretch produces a dense maze/cross-hatch
+pattern that no amount of hole-filling, pruning, or bridge-collapsing
+can clean up, because the pattern isn't a skeleton artifact; it's what
+you get from applying a 1-pixel-wide medial-axis to something that
+isn't 1 pixel wide anywhere. Local width is measured pixel-by-pixel as
+twice the distance-transform value there (the diameter of the biggest
+circle/sphere that fits at that point) -- independent of the
+skeleton's own topology, and independent of the rest of the body, so a
+thin tubule and a swollen stretch on the very same connected body are
+judged separately. Every skeleton node inside a patch that exceeds
+this threshold is merged into one junction, and every branch entirely
+inside that patch is dropped from Branch Count/Branch Length --
+but a real branch connecting the patch to the rest of the network is
+kept and counted normally, so the network stays connected and the
+swollen stretch reads as a single node feeding into it, not a helix of
+spurious branches (a patch with only 1-2 real connections is left as
+an ordinary point along a path, not counted as a junction -- only 3+
+connections make it one). Skeleton pixels are never altered -- see the
+"Skeleton (Collapsed)" overlay note below. One caveat: a kept
+branch's length can include some of the path it
+traced inside the patch before reaching its node there, so Branch
+Length may slightly overstate the real external tubule length. Same
+units as Branch Length. 0 disables it (default).</p>
+<p><i>Collapse Junction Clusters Within (px):</i> Network only, off by
+default. A different tool from Collapse Wide Regions Over: that one
+flags a patch by how <i>thick</i> the mask is there. This instead
+flags a patch by how <i>densely packed</i> real junctions are,
+regardless of mask width -- for a convoluted tangle that isn't
+actually a wide/swollen blob (normal tubule width throughout), but
+still skeletonizes into a maze because many genuinely thin strands are
+crammed into a small physical area. If raising Collapse Wide Regions
+catches real, healthy tubules right alongside the tangle without ever
+isolating just the tangle, that's a sign this control is the better
+fit for what you're looking at. Any two skan-identified true junctions
+(degree &ge;3) within this distance of each other are merged into a
+single junction, regardless of whether a branch directly connects them
+or how many hops apart they are in the graph -- so a dense pileup of,
+say, 10 junctions within a small radius of one another all collapse
+into one. As with Collapse Wide Regions, branches entirely inside a
+collapsed cluster are dropped from Branch Count/Branch Length, while a
+branch reaching a junction outside the cluster is kept and counted
+normally, and skeleton pixels are never touched. Worth knowing: two
+real, distinct branch points that just happen to sit physically near
+each other -- not because they're part of the same tangle, but because
+two separate strands of the network cross nearby -- could get
+incorrectly merged; pick a radius small enough that only a genuinely
+dense pileup of junctions falls within it, not two isolated crossing
+branches. Same units as Branch Length. 0 disables it (default).</p>
+<p><i>Collapse Maze Regions Within (px):</i> Network only, off by
+default. Neither Collapse Wide Regions (mask thickness) nor Collapse
+Junction Clusters (raw spacing between true junctions) is guaranteed
+to cleanly separate a maze/crosshatch artifact from real branching --
+both properties can overlap between the two in a given image. This
+measures something genuinely different: local <i>loop</i> density. A
+maze is characterized by many small closed loops packed into a small
+area (like a woven mesh); real branching, even where dense, tends to
+stay much more tree-like, with far fewer nearby loops. Every
+independent loop in the skeleton graph is found (any branch connecting
+two nodes already reachable from each other via some other path closes
+one); loop endpoints from 2 or more <i>distinct</i> loops that sit
+within this radius of each other are merged into one group, the same
+way Collapse Junction Clusters merges nearby junctions. A single loop
+found on its own -- e.g. one real, biologically meaningful closed
+ring-shaped structure -- is deliberately left alone, since the goal is
+catching a pileup of loops, not any one real loop. As with the other
+three controls, branches entirely inside a merged group are dropped
+from Branch Count/Branch Length, branches reaching outside it are kept
+and counted normally, and skeleton pixels are never touched. Same
+units as Branch Length. 0 disables it (default).</p>
+<p><i>"Skeleton (Collapsed)" overlay:</i> a second Skeleton
+visualization layer, in magenta, showing what the skeleton looks like
+<i>after</i> Collapse Bridges/Collapse Wide Regions/Collapse Junction
+Clusters/Collapse Maze Regions are applied -- every branch absorbed
+into a merged junction by any of the four is left out, so only the
+surviving branches remain (the "Collapse Ch N" button shows this
+together with the Junctions layer, so the merged-junction markers sit
+alongside the simplified network). The normal green Skeleton layer is
+completely unaffected and always shows every pixel regardless. Purely
+a display convenience for seeing/tuning what each threshold is doing
+to the network's shape -- it has no effect on Branch/Junction Count
+itself, which is computed the same way whether or not you're looking
+at this layer.</p>
+<p><i>Diagnostic tip:</i> if a skeleton still looks tangled after
+raising both Fill Holes and Prune Spurs substantially, try raising
+Collapse Bridges too. If that meaningfully simplifies it, the tangle
+was mostly this artifact; if it barely changes, the network is likely
+just genuinely that complex, and the skeleton is representing it
+accurately.</p>
 <p><b>Aspect Ratio</b> &mdash; major/minor axis length of each body's
-best-fit ellipse. Near 1 is circular; higher is more elongated.</p>
+best-fit ellipse. Near 1 is circular; higher is more elongated. On a 3D
+(Z-stack) analysis, this now accounts for the same Z/XY voxel
+calibration ratio used by Contact Threshold (see above), so an object
+that's genuinely round in physical space isn't reported as artificially
+elongated just because Z and XY pixel sizes differ.</p>
 <p><b>Form Factor</b> &mdash; perimeter&sup2; / (4&pi;&times;area), the
 inverse of circularity. More sensitive to branching/irregular outlines
 than Aspect Ratio alone. Not defined for 3D (Z-stack) bodies, where it
 reports as blank/NaN; Aspect Ratio still works in 3D.</p>
 <p><b>Branch Count / Junction Count / Branch Length (per body)</b>
-&mdash; from skeletonizing the mask down to a 1-pixel-wide medial axis
-and classifying each skeleton pixel by neighbor count: a junction is a
-skeleton pixel with 3 or more neighbors. Branch Length is a pixel-count
-approximation of each branch's length, not a true Euclidean path
-length.</p>
+&mdash; the mask is skeletonized down to a 1-pixel-wide medial axis,
+then analyzed with <a href="https://skeleton-analysis.org">skan</a>,
+which builds a proper graph over the skeleton's own pixel adjacency
+(one node per true junction, one edge per branch) rather than
+classifying pixels individually and clustering nearby ones. This
+matters most on dense, tangled networks: two genuinely distinct
+junctions sitting close together can have their neighbor-flagged
+pixels touch, and a pixel-clustering approach can merge them into one
+reported junction -- skan's graph-based approach keeps them correctly
+distinct. A junction is a graph node touched by 3 or more branches.
+Branch Length is each branch's true physical length as skan computes
+it (following the skeleton's actual path, not a straight line), using
+the same Z/XY calibration ratio as Contact Threshold and Aspect Ratio
+-- not a raw pixel count. Branch Count and Junction Count are
+topological (they count objects, not distances), so they were never
+affected by voxel calibration in the first place.</p>
 <p><b>% Bodies with Junctions</b> &mdash; fraction of bodies (by count)
 with at least one junction, i.e. showing any branching.</p>
 <p><b>% Signal Area in Junction-Containing Bodies</b> &mdash; fraction
@@ -296,9 +452,11 @@ resulting pieces often each retain a junction point, so a naive
 per-object junction-presence count can rise even as the structure is
 clearly becoming more fragmented. Read these as trend indicators
 alongside Fragmentation Coefficient, not in isolation.</p>
-<p><i>Tip:</i> in the Morphology section, "Skeleton Ch N" (or the
-"Auto-show skeleton layers" checkbox) displays the skeleton (green)
-and junctions (blue) these metrics are computed from &mdash; the same
+<p><i>Tip:</i> in the Morphology section, "Skeleton Ch N" (or
+"Skeleton"/"Junctions" in Auto-Display Setup, under Metrics &&
+Display Settings -- independently toggleable per channel) displays
+the skeleton (green) and junctions (blue) these metrics are computed
+from &mdash; the same
 color convention used by MiNA/Fiji's Analyze Skeleton.</p>
 <p><i>Performance:</i> both Shape and Network are off by default and
 add real computation time, especially Network on large 3D stacks,
@@ -341,6 +499,25 @@ between contact-region pixels (a spacing/clustering measure).</p>
 divided by the union-of-all-channels signal area (the same area
 reported as "Union" above).</p>
 """
+
+
+class _NoWheelFilter(QObject):
+    """Blocks mouse-wheel events on whatever widget it's installed on,
+    so scrolling the panel (e.g. in the containing QScrollArea) doesn't
+    also nudge a spin box's value whenever the cursor happens to be
+    sitting over one -- a well-known Qt annoyance, since QAbstractSpinBox
+    (and QComboBox/QSlider) respond to wheel events by default even
+    without focus. Installed once, after init_ui() has built every spin
+    box, via self.findChildren(QAbstractSpinBox) -- far less invasive
+    than touching each individual QSpinBox(...)/QDoubleSpinBox(...)
+    call site across the file, and automatically covers any added
+    later."""
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel:
+            event.ignore()
+            return True
+        return super().eventFilter(obj, event)
 
 
 class MetricsGlossaryDialog(QDialog):
@@ -785,6 +962,137 @@ class OutputSelectionDialog(QDialog):
         return sel, enable_comp, self._comparisons
 
 
+class DisplayLayersDialog(QDialog):
+    """Lets the user configure, in one place, exactly which layers get
+    displayed automatically after Analyze runs -- replacing four
+    separate "Auto-show ..." checkboxes that were scattered across the
+    Thresholding/Morphology/Contact Analysis sections and only offered
+    an all-channels-or-none toggle per layer type. This dialog exposes
+    the same underlying per-channel display calls
+    (show_thresholded_channel / show_body_labels_channel /
+    show_skeleton_channel, plus the Contacts layer) as a single grid,
+    so e.g. "Ch 1 + Ch 2 thresholded, Bodies Ch 1, Skeleton Ch 3,
+    Junctions Ch 3" can be set up as one saved combination -- exactly
+    the kind of mixed, per-channel selection the old checkboxes
+    couldn't express. Skeleton, Junctions, and Collapsed are
+    intentionally three separate columns (not one combined "skeleton
+    layers" toggle like the checkbox this dialog replaces), mirroring
+    the three independent "Skeleton Ch N"/"Junction Ch N"/
+    "Collapse Ch N" buttons in the main UI -- show_skeleton_channel
+    accepts independent show_skeleton/show_junctions/show_collapsed
+    flags for exactly this reason."""
+
+    ROWS = [
+        ("thresholded", "Thresholded"),
+        ("body_labels", "Body Labels"),
+        ("skeleton", "Skeleton"),
+        ("junctions", "Junctions"),
+        ("collapsed", "Collapsed"),
+    ]
+
+    def __init__(
+        self,
+        parent: QWidget,
+        current_selection: Dict[str, Any],
+        n_channels_max: int,
+        channel_labels: List[str],
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Auto-Display Setup")
+        self.n_channels_max = n_channels_max
+        self.channel_labels = channel_labels[:]
+        sel = current_selection or {}
+
+        layout = QVBoxLayout()
+        info = QLabel(
+            "Choose which layers are shown automatically after "
+            "clicking Analyze. Each cell below is independent -- mix "
+            "and match any combination of channels and layer types."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        grid_box = QGroupBox("Per-Channel Layers")
+        grid = QGridLayout()
+        for col in range(self.n_channels_max):
+            label = (
+                self.channel_labels[col]
+                if col < len(self.channel_labels)
+                else f"Ch {col + 1}"
+            )
+            grid.addWidget(
+                QLabel(f"<b>{label}</b>"), 0, col + 1,
+                alignment=Qt.AlignCenter,
+            )
+
+        self.checkboxes: Dict[str, List[QCheckBox]] = {}
+        for row_idx, (key, row_label) in enumerate(self.ROWS, start=1):
+            grid.addWidget(QLabel(row_label), row_idx, 0)
+            saved_row = sel.get(key, [])
+            boxes = []
+            for col in range(self.n_channels_max):
+                cb = QCheckBox()
+                cb.setChecked(
+                    bool(saved_row[col]) if col < len(saved_row) else False
+                )
+                grid.addWidget(cb, row_idx, col + 1, alignment=Qt.AlignCenter)
+                boxes.append(cb)
+            self.checkboxes[key] = boxes
+        grid_box.setLayout(grid)
+        layout.addWidget(grid_box)
+
+        select_btn_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_none_btn = QPushButton("Select None")
+        select_all_btn.clicked.connect(lambda: self._set_all(True))
+        select_none_btn.clicked.connect(lambda: self._set_all(False))
+        select_btn_layout.addWidget(select_all_btn)
+        select_btn_layout.addWidget(select_none_btn)
+        select_btn_layout.addStretch(1)
+        layout.addLayout(select_btn_layout)
+
+        other_box = QGroupBox("Other")
+        other_layout = QVBoxLayout()
+        self.cb_contacts = QCheckBox("Contacts")
+        self.cb_contacts.setToolTip(
+            "The combined Contacts overlap layer (not per-channel)."
+        )
+        self.cb_contacts.setChecked(bool(sel.get("contacts", True)))
+        other_layout.addWidget(self.cb_contacts)
+        other_box.setLayout(other_layout)
+        layout.addWidget(other_box)
+
+        note = QLabel(
+            "Only channels active in the current analysis are actually "
+            "shown; toggles for inactive channels are simply ignored. "
+            "Body Labels/Skeleton/Junctions/Collapsed additionally require "
+            "Morphology Shape/Network to be enabled in Output "
+            "Selection for that channel's data to exist yet."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+        self.setLayout(layout)
+
+    def _set_all(self, checked: bool) -> None:
+        for boxes in self.checkboxes.values():
+            for cb in boxes:
+                cb.setChecked(checked)
+
+    def get_results(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            key: [cb.isChecked() for cb in boxes]
+            for key, boxes in self.checkboxes.items()
+        }
+        result["contacts"] = self.cb_contacts.isChecked()
+        return result
+
+
 # -----------------------------
 # Main Widget
 # -----------------------------
@@ -799,6 +1107,19 @@ class OrganelleContactWidget(QWidget):
         self.last_metrics: Any = {}
         self.last_masks: List[np.ndarray] = []
         self.current_roi_index = 0
+
+        # Per-body records (Aspect Ratio, Form Factor, Branch Count,
+        # Junction Count, Branch Length -- one row per surviving body
+        # per channel), for the "Export Per-Body Data" button. Mirrors
+        # metrics_list/last_metrics: last_per_body_rows holds the most
+        # recent Analyze run (tagged with an Analysis Name only once
+        # "Add Analysis" is clicked), per_body_records accumulates
+        # across every "Add Analysis" click, same as metrics_list does
+        # for the aggregated metrics.
+        self._last_bundle_per_body_rows: List[Dict[str, Any]] = []
+        self.last_per_body_rows: List[Dict[str, Any]] = []
+        self.per_body_records: List[Dict[str, Any]] = []
+        self._last_added_per_body_count = 0
 
         self._last_contacts_display: Optional[np.ndarray] = None
         self._last_base_layer: Optional["napari.layers.Image"] = None
@@ -833,6 +1154,21 @@ class OrganelleContactWidget(QWidget):
         self.enable_intensity_comparisons: bool = False
         self.intensity_comparisons: List[Dict[str, Any]] = []
 
+        # Which layers auto-display after Analyze, configured via the
+        # "Auto-Display Setup" dialog (DisplayLayersDialog) -- one
+        # bool per channel (index 0..max_channels_supported-1) for
+        # each per-channel layer type, plus a single flag for the
+        # combined Contacts layer. Defaults mirror the four checkboxes
+        # this replaced: everything off except Contacts.
+        self.display_layers_selection: Dict[str, Any] = {
+            "thresholded": [False] * self.max_channels_supported,
+            "body_labels": [False] * self.max_channels_supported,
+            "skeleton": [False] * self.max_channels_supported,
+            "junctions": [False] * self.max_channels_supported,
+            "collapsed": [False] * self.max_channels_supported,
+            "contacts": True,
+        }
+
         # Saved-image scale bar settings
         self.include_scale_bar_in_saved_image = False
         self.saved_scale_bar_length = 10.0
@@ -842,6 +1178,16 @@ class OrganelleContactWidget(QWidget):
         # Thresholded-signal Z restriction settings
         self.restrict_to_signal_z = False
         self.restrict_signal_z_channels: List[int] = []
+        # Default (False) trims only the empty Z-slices before the
+        # first and after the last signal-containing slice, so the
+        # kept range always stays contiguous -- downstream
+        # connected-component labeling, regionprops, and
+        # skeletonization keep seeing uniformly-spaced data. Opt-in
+        # (True) restores the older, more compact behavior that also
+        # drops empty slices *between* signal-containing ones, which
+        # can weld together structures that were never physically
+        # touching. See the Limitations & Caveats reference.
+        self.restrict_signal_z_drop_interior = False
 
         self.ct_label = QLabel(f"Threshold (px): {self.threshold}")
         self.ct_label.setAlignment(Qt.AlignCenter)
@@ -1077,59 +1423,22 @@ class OrganelleContactWidget(QWidget):
         self.prev_roi_button.clicked.connect(self.prev_roi)
         self.next_roi_button.clicked.connect(self.next_roi)
 
-        self.show_thresh_after_checkbox = QCheckBox(
-            "Auto-show thresholded layers"
-        )
-        self.show_thresh_after_checkbox.setToolTip(
-            "Automatically display each channel's thresholded mask as a "
-            "layer after running Analyze."
-        )
-        self.show_thresh_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self.show_thresh_after_checkbox.setChecked(False)
-        self.show_thresh_after_checkbox.stateChanged.connect(
-            lambda _: self._save_settings()
-        )
-
-        self.show_contacts_after_checkbox = QCheckBox(
-            "Auto-show Contacts layer"
-        )
-        self.show_contacts_after_checkbox.setToolTip(
-            "Automatically display the Contacts layer after running "
-            "Analyze."
-        )
-        self.show_contacts_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self.show_contacts_after_checkbox.setChecked(True)
-        self.show_contacts_after_checkbox.stateChanged.connect(
-            lambda _: self._save_settings()
-        )
-
-        self.show_body_labels_after_checkbox = QCheckBox(
-            "Auto-show body label layers"
-        )
-        self.show_body_labels_after_checkbox.setToolTip(
-            "Automatically display, for each channel, a Labels layer "
-            "showing the individual connected-component \"bodies\" used "
-            "by the Body Count / Fragmentation Coefficient metrics, "
-            "after running Analyze."
-        )
-        self.show_body_labels_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self.show_body_labels_after_checkbox.setChecked(False)
-        self.show_body_labels_after_checkbox.stateChanged.connect(
-            lambda _: self._save_settings()
-        )
-
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.clicked.connect(self.analyze_contacts)
 
         self.output_selection_button = QPushButton("Output Selection")
         self.output_selection_button.clicked.connect(
             self.open_output_selection
+        )
+
+        self.display_layers_button = QPushButton("Auto-Display Setup")
+        self.display_layers_button.setToolTip(
+            "Choose exactly which layers (per channel: Thresholded, "
+            "Body Labels, Skeleton, Junctions; plus Contacts) are shown "
+            "automatically after Analyze runs, in any combination."
+        )
+        self.display_layers_button.clicked.connect(
+            self.open_display_layers_setup
         )
 
         self.channel_numbering_button = QPushButton("Channel Numbering")
@@ -1165,7 +1474,10 @@ class OrganelleContactWidget(QWidget):
             "Restrict Z range to signal"
         )
         self.restrict_signal_z_checkbox.setToolTip(
-            "Restrict analyzed Z-stacks to slices with thresholded signal."
+            "Restrict analyzed Z-stacks to slices with thresholded signal. "
+            "By default this only trims empty slices off the top/bottom of "
+            "the range, keeping any empty slices in the middle intact -- "
+            "see the checkbox below to change that."
         )
         self.restrict_signal_z_checkbox.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Fixed
@@ -1173,6 +1485,29 @@ class OrganelleContactWidget(QWidget):
         self.restrict_signal_z_checkbox.setChecked(False)
         self.restrict_signal_z_checkbox.stateChanged.connect(
             self._on_restrict_signal_z_changed
+        )
+
+        self.restrict_signal_z_drop_interior_checkbox = QCheckBox(
+            "Also drop interior Z gaps"
+        )
+        self.restrict_signal_z_drop_interior_checkbox.setToolTip(
+            "Off (default): only the empty slices before the first and "
+            "after the last signal-containing slice are trimmed, so the "
+            "kept Z range always stays one contiguous block. On: every "
+            "empty slice is dropped, including gaps between "
+            "signal-containing slices -- more compact, but the removed "
+            "gap no longer exists as far as Body Count, Morphology Shape, "
+            "and Morphology Network are concerned, which can weld "
+            "together structures that were never actually touching. "
+            "Contact Threshold / Contact Area are unaffected either way."
+        )
+        self.restrict_signal_z_drop_interior_checkbox.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Fixed
+        )
+        self.restrict_signal_z_drop_interior_checkbox.setChecked(False)
+        self.restrict_signal_z_drop_interior_checkbox.setEnabled(False)
+        self.restrict_signal_z_drop_interior_checkbox.stateChanged.connect(
+            self._on_restrict_signal_z_drop_interior_changed
         )
 
         self.restrict_signal_z_button = QPushButton("Signal Z Channels")
@@ -1201,6 +1536,18 @@ class OrganelleContactWidget(QWidget):
 
         self.save_metrics_button = QPushButton("Export to Excel")
         self.save_metrics_button.clicked.connect(self.save_metrics)
+
+        self.export_per_body_button = QPushButton("Export Per-Body Data")
+        self.export_per_body_button.setToolTip(
+            "Export one row per surviving body per channel (Aspect Ratio, "
+            "Form Factor, Branch Count, Junction Count, Branch Length, "
+            "Area), tagged by Analysis Name and Channel -- raw material "
+            "for building your own histograms. Requires Morphology Shape "
+            "and/or Morphology Network enabled in Output Selection."
+        )
+        self.export_per_body_button.clicked.connect(
+            self.export_per_body_data
+        )
 
         self.append_spreadsheet_button = QPushButton("Append to Excel")
         self.append_spreadsheet_button.setToolTip(
@@ -1287,41 +1634,344 @@ class OrganelleContactWidget(QWidget):
             self._on_filter_threshold_mask_changed
         )
 
+        # Three independent buttons per channel rather than one combined
+        # "Skeleton Ch N" button -- each toggles exactly one of the
+        # three Skeleton visualization layers (raw green skeleton, blue
+        # junction points, magenta collapsed-branches overlay) on its
+        # own, matching the independent show_skeleton/show_junctions/
+        # show_collapsed flags show_skeleton_channel already supports.
+        # Button text is deliberately just the layer name ("Skeleton" /
+        # "Junction" / "Collapse"), not "<Layer> Ch N" -- the row it
+        # sits in (see the skel_btn_layout grid below) already has a
+        # "Ch N:" label, and three short single-word buttons side by
+        # side stay within the panel's width budget where three
+        # "<Layer> Ch N"-length buttons would not (see the QScrollArea
+        # note in init_ui's tail for why that budget matters).
         self.show_skeleton_btns: List[QPushButton] = []
+        self.show_junction_btns: List[QPushButton] = []
+        self.show_collapse_btns: List[QPushButton] = []
         for i in range(self.max_channels_supported):
-            b = QPushButton(f"Skeleton Ch {i+1}")
-            b.setToolTip(
-                f"Show the Morphology Network skeleton/junctions for "
-                f"Channel {i+1} (green skeleton, blue junctions)"
+            skel_b = QPushButton("Skeleton")
+            skel_b.setToolTip(
+                f"Show only the raw Morphology Network skeleton (green) "
+                f"for Channel {i+1}, unmodified -- every skeleton pixel, "
+                f"regardless of any Collapse setting."
             )
-            b.clicked.connect(
-                lambda _, idx=i: self.show_skeleton_channel(idx)
+            skel_b.clicked.connect(
+                lambda _, idx=i: self.show_skeleton_channel(
+                    idx, show_skeleton=True, show_junctions=False,
+                    show_collapsed=False,
+                )
             )
-            self.show_skeleton_btns.append(b)
+            self.show_skeleton_btns.append(skel_b)
 
-        self.show_skeleton_after_checkbox = QCheckBox(
-            "Auto-show skeleton layers"
+            junc_b = QPushButton("Junction")
+            junc_b.setToolTip(
+                f"Show only the Morphology Network junction points "
+                f"(blue) for Channel {i+1}, after any Collapse Bridges/"
+                f"Wide Regions/Junction Clusters merging is applied."
+            )
+            junc_b.clicked.connect(
+                lambda _, idx=i: self.show_skeleton_channel(
+                    idx, show_skeleton=False, show_junctions=True,
+                    show_collapsed=False,
+                )
+            )
+            self.show_junction_btns.append(junc_b)
+
+            collapse_b = QPushButton("Collapse")
+            collapse_b.setToolTip(
+                f"Show the 'Skeleton (Collapsed)' network for Channel "
+                f"{i+1} (magenta lines + the same blue junction points "
+                f"as Junction) -- what the skeleton looks like AFTER "
+                f"Collapse Bridges/Wide Regions/Junction Clusters/Maze "
+                f"Regions are applied: every branch absorbed into a "
+                f"merged junction is left out, so only the surviving "
+                f"branches and merged junction markers remain. Identical "
+                f"to Skeleton if all four collapse settings are 0."
+            )
+            collapse_b.clicked.connect(
+                lambda _, idx=i: self.show_skeleton_channel(
+                    idx, show_skeleton=False, show_junctions=True,
+                    show_collapsed=True,
+                )
+            )
+            self.show_collapse_btns.append(collapse_b)
+
+        self.max_hole_size_label = QLabel("Fill Holes Up To (px):")
+        self.max_hole_size_label.setWordWrap(True)
+        self.max_hole_size_label.setMaximumWidth(150)
+        self.max_hole_size_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred
         )
-        self.show_skeleton_after_checkbox.setToolTip(
-            "Automatically display, for each channel, the skeleton/"
-            "junction layers used by the Morphology Network metrics, "
-            "after running Analyze. Requires 'Morphology Network' to "
-            "be enabled in Output Selection."
+        self.max_hole_size_spinbox = QSpinBox()
+        self.max_hole_size_spinbox.setMinimum(0)
+        self.max_hole_size_spinbox.setMaximum(100000)
+        self.max_hole_size_spinbox.setValue(4)
+        self.max_hole_size_spinbox.setToolTip(
+            "Before computing Morphology Shape and Morphology Network "
+            "(and before displaying the Skeleton/Junctions layers), fill "
+            "any fully-enclosed background hole up to this many "
+            "pixels/voxels -- e.g. thresholding noise inside an "
+            "otherwise-solid body. Without this, skeletonize traces a "
+            "small ring around every such hole, which both looks noisy "
+            "and inflates Branch/Junction Count; small holes also distort "
+            "Aspect Ratio/Form Factor. Larger, presumably real gaps are "
+            "left alone. 0 disables filling. Does not affect Body Count, "
+            "Fragmentation Coefficient, or the Body Labels layer, which "
+            "all keep using the unfilled mask."
         )
-        self.show_skeleton_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
+        self.max_hole_size_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
         )
-        self.show_skeleton_after_checkbox.setChecked(False)
-        self.show_skeleton_after_checkbox.stateChanged.connect(
+
+        self.prune_branch_length_label = QLabel("Prune Spurs Under (px):")
+        self.prune_branch_length_label.setWordWrap(True)
+        self.prune_branch_length_label.setMaximumWidth(150)
+        self.prune_branch_length_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred
+        )
+        self.prune_branch_length_spinbox = QDoubleSpinBox()
+        self.prune_branch_length_spinbox.setDecimals(1)
+        self.prune_branch_length_spinbox.setMinimum(0.0)
+        self.prune_branch_length_spinbox.setMaximum(100000.0)
+        self.prune_branch_length_spinbox.setValue(3.0)
+        self.prune_branch_length_spinbox.setToolTip(
+            "Morphology Network only (Shape is unaffected -- it doesn't "
+            "use a skeleton). A jagged, pixel-noisy mask boundary makes "
+            "skeletonize trace a short spurious stub ('spur') off the "
+            "network for every small bump/notch on that boundary, "
+            "inflating Branch/Junction Count. This removes any branch "
+            "shorter than this length that has exactly one free end "
+            "(the classic spur shape: attached to the network at one "
+            "end, dangling at the other). Branches connecting two real "
+            "junctions, or a body's entire skeleton if it has no "
+            "junctions at all, are left alone regardless of length -- "
+            "only true dead-end stubs are pruned. Same units as Branch "
+            "Length (XY-pixel-equivalent, calibration-aware in 3D). "
+            "0 disables pruning. Applied consistently to the Network "
+            "metrics and the Skeleton/Junctions visualization."
+        )
+        self.prune_branch_length_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        self.collapse_bridge_length_label = QLabel(
+            "Collapse Bridges Under (px):"
+        )
+        self.collapse_bridge_length_label.setWordWrap(True)
+        self.collapse_bridge_length_label.setMaximumWidth(150)
+        self.collapse_bridge_length_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred
+        )
+        self.collapse_bridge_length_spinbox = QDoubleSpinBox()
+        self.collapse_bridge_length_spinbox.setDecimals(1)
+        self.collapse_bridge_length_spinbox.setMinimum(0.0)
+        self.collapse_bridge_length_spinbox.setMaximum(100000.0)
+        self.collapse_bridge_length_spinbox.setValue(0.0)
+        self.collapse_bridge_length_spinbox.setToolTip(
+            "Morphology Network only. Distinct from Prune Spurs Under: "
+            "that removes dangling dead-end stubs, this instead merges "
+            "two junctions that are connected to *each other* by a very "
+            "short branch into a single junction, whenever that "
+            "connecting branch is shorter than this length. Skeletonize "
+            "can produce this pattern -- two closely-spaced junctions "
+            "joined by a short bridge -- at a single irregular/wide spot "
+            "on a jagged mask boundary, which otherwise inflates "
+            "Junction Count and Branch Count without being a real "
+            "second branch point. Unlike Prune Spurs (which deletes "
+            "pixels), this only affects what's counted: the connecting "
+            "branch's length is dropped from Branch Length and the two "
+            "junctions are reported as one, but the skeleton pixels "
+            "themselves -- and every other branch touching either "
+            "junction -- are left as-is. If your skeleton stays just as "
+            "tangled after raising this a lot, that's an indication the "
+            "network's real complexity, not this artifact, is behind "
+            "it. Same units as Branch Length (XY-pixel-equivalent, "
+            "calibration-aware in 3D). 0 disables collapsing (default)."
+        )
+        self.collapse_bridge_length_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        self.max_local_width_label = QLabel(
+            "Collapse Wide Regions Over (px):"
+        )
+        self.max_local_width_label.setWordWrap(True)
+        self.max_local_width_label.setMaximumWidth(150)
+        self.max_local_width_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred
+        )
+        self.max_local_width_spinbox = QDoubleSpinBox()
+        self.max_local_width_spinbox.setDecimals(1)
+        self.max_local_width_spinbox.setMinimum(0.0)
+        self.max_local_width_spinbox.setMaximum(100000.0)
+        self.max_local_width_spinbox.setValue(0.0)
+        self.max_local_width_spinbox.setToolTip(
+            "Morphology Network only. A fundamentally different problem "
+            "from Fill Holes/Prune Spurs/Collapse Bridges: those three "
+            "clean up thin-skeleton-level noise (holes, dangling stubs, "
+            "kinked junctions) on a body that's genuinely tubular "
+            "throughout. This instead handles a body that's tubular in "
+            "most places but has a locally wide, swollen/globular "
+            "stretch woven into it -- a real reticular network that "
+            "just happens to bulge in one spot, not a separate blob. "
+            "Skeletonizing that wide stretch produces a dense, "
+            "maze-like tangle of short ridges (many interior pixels sit "
+            "roughly equidistant from the boundary in several "
+            "directions at once), which inflates Branch/Junction Count "
+            "as if the network branched dozens of times right there.\n\n"
+            "Any patch whose local width (2x the largest inscribed-"
+            "circle radius at that point, via a distance transform) "
+            "exceeds this value gets every skeleton node inside it "
+            "merged into a single junction, and every branch entirely "
+            "inside it dropped from Branch Count/Branch Length -- but "
+            "real branches connecting that patch to the rest of the "
+            "network are kept and counted normally, so the network "
+            "stays connected and the swollen stretch reads as one node, "
+            "not a helix of spurious branches. (A patch with only 1-2 "
+            "real connections is correctly left as an ordinary point "
+            "along a path, not counted as a junction at all -- only "
+            "3+ connections make it one.) Skeleton pixels themselves "
+            "are never altered; the Skeleton visualization's magenta "
+            "'Skeleton (Collapsed)' layer (shared with Collapse "
+            "Bridges/Collapse Junction Clusters/Collapse Maze Regions) "
+            "shows what the skeleton looks like with all of this "
+            "collapsing already applied. "
+            "One caveat: a kept branch's length "
+            "can include a bit of the path it traced inside the patch "
+            "before reaching its node there, so Branch Length may "
+            "slightly overstate the real external tubule length. Same "
+            "units as Branch Length (XY-pixel-equivalent, calibration-"
+            "aware in 3D). 0 disables this entirely (default)."
+        )
+        self.max_local_width_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        self.collapse_cluster_radius_label = QLabel(
+            "Collapse Junction Clusters Within (px):"
+        )
+        self.collapse_cluster_radius_label.setWordWrap(True)
+        self.collapse_cluster_radius_label.setMaximumWidth(150)
+        self.collapse_cluster_radius_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred
+        )
+        self.collapse_cluster_radius_spinbox = QDoubleSpinBox()
+        self.collapse_cluster_radius_spinbox.setDecimals(1)
+        self.collapse_cluster_radius_spinbox.setMinimum(0.0)
+        self.collapse_cluster_radius_spinbox.setMaximum(100000.0)
+        self.collapse_cluster_radius_spinbox.setValue(0.0)
+        self.collapse_cluster_radius_spinbox.setToolTip(
+            "Morphology Network only, off by default. A different tool "
+            "from Collapse Wide Regions Over: that one flags a patch by "
+            "how THICK the mask is there. This instead flags a patch by "
+            "how DENSELY PACKED real junctions are, regardless of mask "
+            "width -- for a convoluted tangle that isn't actually a "
+            "wide/swollen blob (normal tubule width throughout), but "
+            "still skeletonizes into a maze because many genuinely thin "
+            "strands are crammed into a small physical area. If raising "
+            "Collapse Wide Regions catches real, healthy tubules right "
+            "alongside the tangle without ever isolating just the "
+            "tangle, that's a sign this control is the better fit.\n\n"
+            "Any two skan-identified true junctions (degree >=3) within "
+            "this distance of each other are merged into a single "
+            "junction, regardless of whether a branch directly connects "
+            "them or how many hops apart they are in the graph -- so a "
+            "dense pileup of, say, 10 junctions within a small radius "
+            "of one another all collapse into one. Branches entirely "
+            "inside a collapsed cluster are dropped from Branch Count/"
+            "Branch Length; branches reaching a junction outside the "
+            "cluster are kept and counted normally, same as Collapse "
+            "Wide Regions. Risk to be aware of: two real, distinct "
+            "branch points that just happen to sit physically near each "
+            "other (e.g. two separate strands crossing nearby) -- not "
+            "because they're part of the same tangle -- could get "
+            "incorrectly merged. Pick a radius small enough that only a "
+            "genuinely dense pileup of many junctions falls within it, "
+            "not two isolated crossing branches. Skeleton pixels are "
+            "never touched. Same units as Branch Length (XY-pixel-"
+            "equivalent, calibration-aware in 3D). 0 disables this "
+            "entirely (default)."
+        )
+        self.collapse_cluster_radius_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        self.collapse_maze_radius_label = QLabel(
+            "Collapse Maze Regions Within (px):"
+        )
+        self.collapse_maze_radius_label.setWordWrap(True)
+        self.collapse_maze_radius_label.setMaximumWidth(150)
+        self.collapse_maze_radius_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Preferred
+        )
+        self.collapse_maze_radius_spinbox = QDoubleSpinBox()
+        self.collapse_maze_radius_spinbox.setDecimals(1)
+        self.collapse_maze_radius_spinbox.setMinimum(0.0)
+        self.collapse_maze_radius_spinbox.setMaximum(100000.0)
+        self.collapse_maze_radius_spinbox.setValue(0.0)
+        self.collapse_maze_radius_spinbox.setToolTip(
+            "Morphology Network only, off by default. Neither Collapse "
+            "Wide Regions (mask thickness) nor Collapse Junction "
+            "Clusters (raw spacing between true junctions) reliably "
+            "separated a maze/crosshatch artifact from real branching "
+            "in testing -- both properties can overlap between the "
+            "two. This instead measures something genuinely different: "
+            "local LOOP density. A maze pattern is characterized by "
+            "many small closed loops packed into a small area (like a "
+            "woven mesh); real branching, even when dense, tends to be "
+            "much more tree-like with far fewer nearby loops.\n\n"
+            "Every independent loop in the skeleton graph is found "
+            "(any branch connecting two nodes already connected via "
+            "another path closes one). Only where 2 or more distinct "
+            "loops sit within this radius of each other -- a genuinely "
+            "dense pileup, not a single isolated one -- are all their "
+            "nodes merged into one group, the same way Collapse "
+            "Junction Clusters merges nearby junctions. A single real "
+            "closed loop on its own (e.g. one biologically real ring-"
+            "shaped structure) is deliberately left untouched, since "
+            "only 1 loop is present there, not a pileup. Branches "
+            "entirely inside a merged group are dropped from Branch "
+            "Count/Branch Length; branches reaching outside it are "
+            "kept and counted normally, same as the other Collapse "
+            "controls. Skeleton pixels are never touched. Same units "
+            "as Branch Length (XY-pixel-equivalent, calibration-aware "
+            "in 3D). 0 disables this entirely (default)."
+        )
+        self.collapse_maze_radius_spinbox.valueChanged.connect(
             lambda _: self._save_settings()
         )
 
         self.show_contacts_button = QPushButton("Show Contacts")
         self.show_contacts_button.clicked.connect(self.show_contacts)
 
+        # Analyze runs synchronously on the GUI thread (see
+        # analyze_contacts's docstring for why), so this progress bar
+        # is driven by periodic QApplication.processEvents() pumps at
+        # natural checkpoints (per-channel, per-ROI, per-channel within
+        # Morphology Shape/Network) rather than a background worker
+        # signal -- those same pumps are also what keeps napari's
+        # window repainting and able to accept window-manager focus
+        # (e.g. alt-tab) during a long Analyze run, instead of the
+        # whole application appearing frozen for its entire duration.
+        self.analysis_progress_bar = QProgressBar()
+        self.analysis_progress_bar.setVisible(False)
+        self.analysis_progress_bar.setTextVisible(True)
+
         self._metric_display_keys: Optional[List[str]] = None
 
         self.init_ui()
+
+        # Stop accidental value changes when the user scrolls the
+        # panel with the cursor sitting over a spin box -- see
+        # _NoWheelFilter. Installed after init_ui() so this picks up
+        # every spin box the UI actually built, without needing to
+        # touch each individual creation call above.
+        self._no_wheel_filter = _NoWheelFilter(self)
+        for spinbox in self.findChildren(QAbstractSpinBox):
+            spinbox.installEventFilter(self._no_wheel_filter)
+
         self._load_settings()
         self._sync_thresh_mode_states()
         self._on_filter_threshold_mask_changed()
@@ -1337,26 +1987,33 @@ class OrganelleContactWidget(QWidget):
         helper so every section of the widget gets the same visual
         treatment (title styling, margins) with one place to adjust it."""
         box = QGroupBox(title)
-        # Nudge the title a few pixels above the box's top border (via a
-        # negative "top" offset) and add matching top padding inside the
-        # box, so the title has clear space of its own instead of
-        # crowding the first row of controls beneath it.
+        # margin-top reserves space above the box's border for the
+        # title to sit in; padding-top then keeps the first row of
+        # controls from crowding the border beneath it. The title
+        # previously used a negative "top" offset to nudge it upward
+        # within that margin band -- on top of a bold font's height,
+        # that pushed the title's ascenders right to (or past) the very
+        # top edge of the box's own allocated space, clipping it,
+        # especially once the layout's inter-section spacing was
+        # tightened. Left at its default (centered) position within a
+        # slightly taller margin-top band instead, which comfortably
+        # contains the bold title text without needing a negative
+        # offset at all.
         box.setStyleSheet(
             "QGroupBox {"
             "  font-weight: bold;"
-            "  margin-top: 10px;"
-            "  padding-top: 12px;"
+            "  margin-top: 14px;"
+            "  padding-top: 10px;"
             "}"
             "QGroupBox::title {"
             "  subcontrol-origin: margin;"
             "  subcontrol-position: top left;"
             "  left: 6px;"
-            "  top: -4px;"
             "  padding: 0 3px;"
             "}"
         )
-        inner_layout.setContentsMargins(6, 4, 6, 6)
-        inner_layout.setSpacing(4)
+        inner_layout.setContentsMargins(5, 3, 5, 5)
+        inner_layout.setSpacing(3)
         box.setLayout(inner_layout)
         box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         return box
@@ -1370,8 +2027,8 @@ class OrganelleContactWidget(QWidget):
         container = QWidget()
         container.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         layout = QVBoxLayout()
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(8)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
 
         # --- Channel & Image Setup ---
         setup_layout = QVBoxLayout()
@@ -1399,6 +2056,9 @@ class OrganelleContactWidget(QWidget):
         z_group_layout.addWidget(self.auto_adjust_z_range_checkbox)
         z_group_layout.addWidget(self.restrict_signal_z_checkbox)
         z_group_layout.addWidget(
+            self.restrict_signal_z_drop_interior_checkbox
+        )
+        z_group_layout.addWidget(
             self.restrict_signal_z_button, alignment=Qt.AlignLeft
         )
         layout.addWidget(self._group_box("Z-Stack Range", z_group_layout))
@@ -1406,12 +2066,10 @@ class OrganelleContactWidget(QWidget):
         # --- Thresholding ---
         thresh_group_layout = QVBoxLayout()
         thresh_group_layout.addWidget(self.channel_thresh_container)
-        thresh_group_layout.addWidget(self.show_thresh_after_checkbox)
         thresh_btn_layout = QGridLayout()
         for i, b in enumerate(self.show_thresh_btns):
             thresh_btn_layout.addWidget(b, i // 2, i % 2)
         thresh_group_layout.addLayout(thresh_btn_layout)
-        thresh_group_layout.addWidget(self.show_body_labels_after_checkbox)
         body_btn_layout = QGridLayout()
         for i, b in enumerate(self.show_body_labels_btns):
             body_btn_layout.addWidget(b, i // 2, i % 2)
@@ -1443,10 +2101,56 @@ class OrganelleContactWidget(QWidget):
         )
         morph_note.setWordWrap(True)
         morph_group_layout.addWidget(morph_note)
-        morph_group_layout.addWidget(self.show_skeleton_after_checkbox)
+        hole_size_layout = QHBoxLayout()
+        hole_size_layout.addWidget(self.max_hole_size_label)
+        hole_size_layout.addWidget(self.max_hole_size_spinbox)
+        hole_size_layout.addStretch(1)
+        morph_group_layout.addLayout(hole_size_layout)
+        prune_layout = QHBoxLayout()
+        prune_layout.addWidget(self.prune_branch_length_label)
+        prune_layout.addWidget(self.prune_branch_length_spinbox)
+        prune_layout.addStretch(1)
+        morph_group_layout.addLayout(prune_layout)
+        collapse_layout = QHBoxLayout()
+        collapse_layout.addWidget(self.collapse_bridge_length_label)
+        collapse_layout.addWidget(self.collapse_bridge_length_spinbox)
+        collapse_layout.addStretch(1)
+        morph_group_layout.addLayout(collapse_layout)
+        max_width_layout = QHBoxLayout()
+        max_width_layout.addWidget(self.max_local_width_label)
+        max_width_layout.addWidget(self.max_local_width_spinbox)
+        max_width_layout.addStretch(1)
+        morph_group_layout.addLayout(max_width_layout)
+        cluster_radius_layout = QHBoxLayout()
+        cluster_radius_layout.addWidget(self.collapse_cluster_radius_label)
+        cluster_radius_layout.addWidget(
+            self.collapse_cluster_radius_spinbox
+        )
+        cluster_radius_layout.addStretch(1)
+        morph_group_layout.addLayout(cluster_radius_layout)
+        maze_radius_layout = QHBoxLayout()
+        maze_radius_layout.addWidget(self.collapse_maze_radius_label)
+        maze_radius_layout.addWidget(self.collapse_maze_radius_spinbox)
+        maze_radius_layout.addStretch(1)
+        morph_group_layout.addLayout(maze_radius_layout)
+        # A "Ch N:" row label plus one row per channel, 3 columns:
+        # Skeleton / Junction / Collapse -- column headers name each
+        # layer once instead of repeating it in every button (which is
+        # why the buttons themselves just say "Skeleton"/"Junction"/
+        # "Collapse", not "Skeleton Ch N" etc. -- see the note where
+        # they're created), keeping the row narrow enough to stay
+        # within the panel's width budget (see the QScrollArea note in
+        # init_ui's tail for why that budget matters).
         skel_btn_layout = QGridLayout()
-        for i, b in enumerate(self.show_skeleton_btns):
-            skel_btn_layout.addWidget(b, i // 2, i % 2)
+        for col, text in enumerate(("Skeleton", "Junction", "Collapse")):
+            header = QLabel(f"<b>{text}</b>")
+            header.setAlignment(Qt.AlignCenter)
+            skel_btn_layout.addWidget(header, 0, col + 1)
+        for i in range(self.max_channels_supported):
+            skel_btn_layout.addWidget(QLabel(f"Ch {i+1}:"), i + 1, 0)
+            skel_btn_layout.addWidget(self.show_skeleton_btns[i], i + 1, 1)
+            skel_btn_layout.addWidget(self.show_junction_btns[i], i + 1, 2)
+            skel_btn_layout.addWidget(self.show_collapse_btns[i], i + 1, 3)
         morph_group_layout.addLayout(skel_btn_layout)
         layout.addWidget(self._group_box("Morphology", morph_group_layout))
 
@@ -1462,6 +2166,30 @@ class OrganelleContactWidget(QWidget):
         nav_layout.addStretch(1)
         roi_group_layout.addLayout(nav_layout)
         layout.addWidget(self._group_box("ROI Tools", roi_group_layout))
+
+        # --- Metrics & Display Settings ---
+        # Deliberately sits before Contact Analysis/Analyze: Output
+        # Selection determines *what gets computed* when Analyze runs
+        # (including whether Morphology Shape/Network run at all, since
+        # both default off), so it belongs with the rest of the setup
+        # steps, not after the button that consumes it -- otherwise the
+        # natural first-time path is "click Analyze, then discover you
+        # needed to configure this first, then re-run."
+        metrics_group_layout = QVBoxLayout()
+        metrics_grid = QGridLayout()
+        metrics_grid.addWidget(self.output_selection_button, 0, 0)
+        metrics_grid.addWidget(self.metric_display_selection_button, 0, 1)
+        metrics_grid.addWidget(self.scale_bar_settings_button, 1, 0)
+        metrics_grid.addWidget(self.metrics_glossary_button, 1, 1)
+        metrics_grid.addWidget(self.display_layers_button, 2, 0)
+        metrics_grid.setColumnStretch(2, 1)
+        metrics_group_layout.addLayout(metrics_grid)
+        metrics_group_layout.addWidget(self.scale_bar_status_label)
+        layout.addWidget(
+            self._group_box(
+                "Metrics && Display Settings", metrics_group_layout
+            )
+        )
 
         # --- Contact Analysis ---
         contact_group_layout = QVBoxLayout()
@@ -1483,26 +2211,10 @@ class OrganelleContactWidget(QWidget):
         contact_group_layout.addLayout(voxel_cal_layout)
 
         contact_group_layout.addWidget(self.analyze_button)
-        contact_group_layout.addWidget(self.show_contacts_after_checkbox)
+        contact_group_layout.addWidget(self.analysis_progress_bar)
         contact_group_layout.addWidget(self.show_contacts_button)
         layout.addWidget(
             self._group_box("Contact Analysis", contact_group_layout)
-        )
-
-        # --- Metrics & Display Settings ---
-        metrics_group_layout = QVBoxLayout()
-        metrics_grid = QGridLayout()
-        metrics_grid.addWidget(self.output_selection_button, 0, 0)
-        metrics_grid.addWidget(self.metric_display_selection_button, 0, 1)
-        metrics_grid.addWidget(self.scale_bar_settings_button, 1, 0)
-        metrics_grid.addWidget(self.metrics_glossary_button, 1, 1)
-        metrics_grid.setColumnStretch(2, 1)
-        metrics_group_layout.addLayout(metrics_grid)
-        metrics_group_layout.addWidget(self.scale_bar_status_label)
-        layout.addWidget(
-            self._group_box(
-                "Metrics && Display Settings", metrics_group_layout
-            )
         )
 
         # --- Results & Analysis Management ---
@@ -1533,6 +2245,7 @@ class OrganelleContactWidget(QWidget):
         manage_grid.addWidget(self.export_graphpad_button, 1, 1)
         manage_grid.addWidget(self.append_spreadsheet_button, 2, 0)
         manage_grid.addWidget(self.append_graphpad_button, 2, 1)
+        manage_grid.addWidget(self.export_per_body_button, 3, 0, 1, 2)
         manage_grid.setColumnStretch(2, 1)
         save_group_layout.addLayout(manage_grid)
         layout.addWidget(
@@ -1620,15 +2333,21 @@ class OrganelleContactWidget(QWidget):
             ),
             "restrict_signal_z": self.restrict_signal_z_checkbox.isChecked(),
             "restrict_signal_z_channels": self.restrict_signal_z_channels,
-            "show_thresh_after": self.show_thresh_after_checkbox.isChecked(),
-            "show_body_labels_after": (
-                self.show_body_labels_after_checkbox.isChecked()
+            "restrict_signal_z_drop_interior": (
+                self.restrict_signal_z_drop_interior_checkbox.isChecked()
             ),
-            "show_skeleton_after": (
-                self.show_skeleton_after_checkbox.isChecked()
+            "display_layers_selection": self.display_layers_selection,
+            "max_hole_size": self.max_hole_size_spinbox.value(),
+            "prune_branch_length": self.prune_branch_length_spinbox.value(),
+            "collapse_bridge_length": (
+                self.collapse_bridge_length_spinbox.value()
             ),
-            "show_contacts_after": (
-                self.show_contacts_after_checkbox.isChecked()
+            "max_local_width": self.max_local_width_spinbox.value(),
+            "collapse_cluster_radius": (
+                self.collapse_cluster_radius_spinbox.value()
+            ),
+            "collapse_maze_radius": (
+                self.collapse_maze_radius_spinbox.value()
             ),
             "min_body_size": self.min_body_size_spinbox.value(),
             "filter_body_metrics": (
@@ -1761,18 +2480,97 @@ class OrganelleContactWidget(QWidget):
             self.restrict_signal_z_checkbox.setChecked(
                 bool(data.get("restrict_signal_z", False))
             )
-            self.show_thresh_after_checkbox.setChecked(
-                bool(data.get("show_thresh_after", False))
+            self.restrict_signal_z_drop_interior_checkbox.setChecked(
+                bool(data.get("restrict_signal_z_drop_interior", False))
             )
-            self.show_body_labels_after_checkbox.setChecked(
-                bool(data.get("show_body_labels_after", False))
-            )
-            self.show_skeleton_after_checkbox.setChecked(
-                bool(data.get("show_skeleton_after", False))
-            )
-            self.show_contacts_after_checkbox.setChecked(
-                bool(data.get("show_contacts_after", True))
-            )
+            if isinstance(data.get("display_layers_selection"), dict):
+                saved = data["display_layers_selection"]
+                n = self.max_channels_supported
+                for key in (
+                    "thresholded", "body_labels", "skeleton", "junctions",
+                    "collapsed",
+                ):
+                    row = saved.get(key, [])
+                    if isinstance(row, list):
+                        padded = [bool(v) for v in row[:n]]
+                        padded += [False] * (n - len(padded))
+                        self.display_layers_selection[key] = padded
+                self.display_layers_selection["contacts"] = bool(
+                    saved.get("contacts", True)
+                )
+            elif (
+                "show_thresh_after" in data
+                or "show_body_labels_after" in data
+                or "show_skeleton_after" in data
+            ):
+                # Migrate pre-"Auto-Display Setup" settings: the old
+                # checkboxes applied to every channel at once, so carry
+                # that forward as "all channels on" for whichever
+                # layer types were previously enabled, rather than
+                # silently resetting everything to off.
+                n = self.max_channels_supported
+                if bool(data.get("show_thresh_after", False)):
+                    self.display_layers_selection["thresholded"] = [True] * n
+                if bool(data.get("show_body_labels_after", False)):
+                    self.display_layers_selection["body_labels"] = [True] * n
+                if bool(data.get("show_skeleton_after", False)):
+                    self.display_layers_selection["skeleton"] = [True] * n
+                    self.display_layers_selection["junctions"] = [True] * n
+                self.display_layers_selection["contacts"] = bool(
+                    data.get("show_contacts_after", True)
+                )
+            if "max_hole_size" in data:
+                self.max_hole_size_spinbox.setValue(
+                    int(np.clip(int(data["max_hole_size"]), 0, 100000))
+                )
+            if "prune_branch_length" in data:
+                self.prune_branch_length_spinbox.setValue(
+                    float(
+                        np.clip(
+                            float(data["prune_branch_length"]),
+                            0.0,
+                            100000.0,
+                        )
+                    )
+                )
+            if "collapse_bridge_length" in data:
+                self.collapse_bridge_length_spinbox.setValue(
+                    float(
+                        np.clip(
+                            float(data["collapse_bridge_length"]),
+                            0.0,
+                            100000.0,
+                        )
+                    )
+                )
+            if "max_local_width" in data:
+                self.max_local_width_spinbox.setValue(
+                    float(
+                        np.clip(
+                            float(data["max_local_width"]), 0.0, 100000.0
+                        )
+                    )
+                )
+            if "collapse_cluster_radius" in data:
+                self.collapse_cluster_radius_spinbox.setValue(
+                    float(
+                        np.clip(
+                            float(data["collapse_cluster_radius"]),
+                            0.0,
+                            100000.0,
+                        )
+                    )
+                )
+            if "collapse_maze_radius" in data:
+                self.collapse_maze_radius_spinbox.setValue(
+                    float(
+                        np.clip(
+                            float(data["collapse_maze_radius"]),
+                            0.0,
+                            100000.0,
+                        )
+                    )
+                )
             if "min_body_size" in data:
                 self.min_body_size_spinbox.setValue(
                     int(np.clip(int(data["min_body_size"]), 1, 100000))
@@ -2024,6 +2822,11 @@ class OrganelleContactWidget(QWidget):
     def _on_restrict_signal_z_changed(self, state):
         self.restrict_to_signal_z = bool(state)
         self.restrict_signal_z_button.setEnabled(bool(state))
+        self.restrict_signal_z_drop_interior_checkbox.setEnabled(bool(state))
+        self._save_settings()
+
+    def _on_restrict_signal_z_drop_interior_changed(self, state):
+        self.restrict_signal_z_drop_interior = bool(state)
         self._save_settings()
 
     def _get_default_restrict_signal_z_channels(
@@ -2039,8 +2842,25 @@ class OrganelleContactWidget(QWidget):
         return list(range(n_channels))
 
     def _compute_signal_restricted_z_indices(
-        self, masks: List[np.ndarray], selected_channels: List[int]
+        self,
+        masks: List[np.ndarray],
+        selected_channels: List[int],
+        drop_interior: bool = False,
     ) -> Optional[np.ndarray]:
+        """Return the Z indices to keep for "Restrict Z range to
+        signal". When ``drop_interior`` is False (the default), only
+        the empty slices before the first and after the last
+        signal-containing slice are trimmed, so the result is always
+        one contiguous range -- downstream connected-component
+        labeling, regionprops, and skeletonization keep seeing
+        uniformly-spaced data, matching the sampling/spacing those
+        now assume. When True, every empty slice is dropped, including
+        ones between two signal-containing slices, which is more
+        compact but can weld together structures that were never
+        physically adjacent (see the Limitations & Caveats reference).
+        Contact Threshold / Contact Area are unaffected by this choice
+        either way, since their distance transform already runs on the
+        full, correctly-spaced volume before this crop is applied."""
         if not masks:
             return None
         if masks[0].ndim < 3:
@@ -2059,10 +2879,15 @@ class OrganelleContactWidget(QWidget):
             has_signal = np.any(masks[ch], axis=reduce_axes)
             z_keep = has_signal if z_keep is None else (z_keep | has_signal)
 
-        if z_keep is None:
+        if z_keep is None or not np.any(z_keep):
             return None
 
-        keep_idx = np.where(z_keep)[0]
+        nz = np.where(z_keep)[0]
+        if drop_interior:
+            keep_idx = nz
+        else:
+            keep_idx = np.arange(int(nz[0]), int(nz[-1]) + 1)
+
         return keep_idx if keep_idx.size > 0 else None
 
     def _get_display_transform_for_current_analysis(
@@ -2283,6 +3108,18 @@ class OrganelleContactWidget(QWidget):
             self.intensity_comparisons = comps
             self._save_settings()
 
+    def open_display_layers_setup(self):
+        labels = self.get_channel_labels()
+        dlg = DisplayLayersDialog(
+            self,
+            current_selection=self.display_layers_selection,
+            n_channels_max=self.max_channels_supported,
+            channel_labels=labels,
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            self.display_layers_selection = dlg.get_results()
+            self._save_settings()
+
     def open_channel_numbering(self):
         layers = self._get_image_layers()
         n = self._get_active_channel_count()
@@ -2489,7 +3326,79 @@ class OrganelleContactWidget(QWidget):
             self._save_settings()
 
     # ---------------- Analysis ----------------
+    def _pump_events(self):
+        """Let Qt process pending events -- repaints, and critically,
+        window-manager events like alt-tab/focus changes -- during a
+        long synchronous computation. Analyze runs entirely on the GUI
+        thread; without periodic pumps like this one, napari's window
+        can't repaint or even accept being switched into for the
+        entire duration of a long analysis, which is what "napari
+        freezes and is unable to be tabbed into" actually is. Called
+        at natural checkpoints (per channel, per ROI, per channel
+        within Morphology Shape/Network -- the slowest part on large
+        3D stacks) frequently enough that no single gap between calls
+        should run more than a couple of seconds on typical data.
+        Wrapped defensively since this is cosmetic -- a failure here
+        should never break the analysis itself."""
+        try:
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def _set_analysis_progress(
+        self, done: int, total: int, message: str
+    ) -> None:
+        """Move the progress bar to ``done``/``total`` with ``message``
+        as its label, and pump events so the change is actually
+        visible immediately rather than queued behind whatever
+        computation runs next."""
+        total = max(total, 1)
+        self.analysis_progress_bar.setMaximum(total)
+        self.analysis_progress_bar.setValue(min(done, total))
+        self.analysis_progress_bar.setFormat(f"{message} (%p%)")
+        self._pump_events()
+
+    def _set_analysis_progress_message(self, message: str) -> None:
+        """Update the progress bar's label without moving its value --
+        for sub-steps (e.g. "Morphology Network: channel 2/3") nested
+        inside a step that's already been given its own tick, where we
+        don't have a precise enough total to award partial credit."""
+        self.analysis_progress_bar.setFormat(f"{message} (%p%)")
+        self._pump_events()
+
     def analyze_contacts(self):
+        """Threshold every active channel, compute contacts, and
+        compute every enabled metric (per ROI, if any are drawn and
+        "Per Shape" is on; otherwise for the full image).
+
+        This entire method runs on napari's GUI thread rather than a
+        background worker. A background-thread version was considered
+        (and would be the more thorough fix for the UI freezing during
+        a long run), but this codebase's metrics computation reads
+        many small pieces of widget state directly (checkboxes,
+        spinboxes) throughout -- moving that safely off the GUI thread
+        would mean either duplicating all of it into a settings
+        snapshot passed into a worker, or accepting the same
+        widget-reads-from-a-background-thread risk anyway, and neither
+        could be verified against a real napari/Qt runtime in the
+        environment this was written in. Instead, self._pump_events()
+        is called at every natural checkpoint below (and inside
+        _compute_metrics_bundle's per-channel loops), which keeps
+        napari's window repainting and able to accept window-manager
+        focus throughout -- addressing the actual "frozen, can't tab
+        into it" symptom -- while leaving the simpler, already-verified
+        single-threaded structure in place. See self.analysis_progress_bar
+        for the visible progress this same instrumentation drives."""
+        self.analyze_button.setEnabled(False)
+        self.analysis_progress_bar.setVisible(True)
+        self.analysis_progress_bar.setValue(0)
+        try:
+            self._analyze_contacts_impl()
+        finally:
+            self.analyze_button.setEnabled(True)
+            self.analysis_progress_bar.setVisible(False)
+
+    def _analyze_contacts_impl(self):
         try:
             raw_signals, norm_signals, base_layer = (
                 self._get_signals_for_analysis()
@@ -2545,11 +3454,24 @@ class OrganelleContactWidget(QWidget):
                 (z_xy_ratio, 1.0, 1.0) if m.ndim == 3 else None
             )
             dists.append(distance_transform_edt(~m, sampling=sampling))
+            self._set_analysis_progress(
+                i + 1, n, f"Thresholding channel {i + 1}/{n}"
+            )
 
+        # Contact Threshold's ``dists`` were already computed above on
+        # the full, correctly Z/XY-spaced volume, so this crop can't
+        # affect Contact Threshold/Contact Area correctness. By default
+        # (restrict_signal_z_drop_interior=False) the kept range stays
+        # one contiguous block, so everything computed downstream of
+        # this crop -- Body Count, Morphology Shape, Morphology Network
+        # -- keeps seeing uniformly-spaced data too. See
+        # _compute_signal_restricted_z_indices for the opt-in
+        # non-contiguous mode and its tradeoffs.
         if self.restrict_to_signal_z and masks and masks[0].ndim >= 3:
             selected_channels = self._get_default_restrict_signal_z_channels(n)
             keep_idx = self._compute_signal_restricted_z_indices(
-                masks, selected_channels
+                masks, selected_channels,
+                drop_interior=self.restrict_signal_z_drop_interior,
             )
 
             if keep_idx is not None:
@@ -2606,9 +3528,14 @@ class OrganelleContactWidget(QWidget):
         ):
             roi_polys = list(roi_layer.data)
             per_roi_metrics: List[Dict[str, Any]] = []
+            all_per_body_rows: List[Dict[str, Any]] = []
             union_contacts = np.zeros_like(masks[0], dtype=bool)
+            n_rois = len(roi_polys)
 
             for idx, poly in enumerate(roi_polys):
+                self._set_analysis_progress(
+                    idx, n_rois, f"Computing metrics: ROI {idx + 1}/{n_rois}"
+                )
                 poly_data = np.array(poly, dtype=float)
 
                 # No world<->data conversion needed here: the ROI layer
@@ -2670,12 +3597,26 @@ class OrganelleContactWidget(QWidget):
                     ch_labels=ch_labels,
                     roi_poly_data=poly_data,
                     roi_area=roi_area,
+                    z_xy_ratio=z_xy_ratio,
+                    progress_callback=(
+                        lambda msg, _idx=idx: self._set_analysis_progress_message(
+                            f"ROI {_idx + 1}/{n_rois}: {msg}"
+                        )
+                    ),
                 )
                 metrics["ROI Number"] = idx
                 per_roi_metrics.append(metrics)
+                for row in self._last_bundle_per_body_rows:
+                    r = dict(row)
+                    r["ROI Number"] = idx
+                    all_per_body_rows.append(r)
                 union_contacts |= restricted_contacts
 
+            self._set_analysis_progress(
+                n_rois, n_rois, f"Computing metrics: {n_rois}/{n_rois} ROIs"
+            )
             self.last_metrics = per_roi_metrics
+            self.last_per_body_rows = all_per_body_rows
             self.current_roi_index = 0
             self.update_roi_navigation(len(per_roi_metrics))
             self.update_roi_display()
@@ -2683,6 +3624,7 @@ class OrganelleContactWidget(QWidget):
         else:
             roi_area_full = int(masks[0].size)
 
+            self._set_analysis_progress(0, 1, "Computing metrics")
             self.last_metrics = self._compute_metrics_bundle(
                 raw_signals=raw_signals,
                 masks=masks,
@@ -2690,7 +3632,11 @@ class OrganelleContactWidget(QWidget):
                 ch_labels=ch_labels,
                 roi_poly_data=None,
                 roi_area=roi_area_full,
+                z_xy_ratio=z_xy_ratio,
+                progress_callback=self._set_analysis_progress_message,
             )
+            self._set_analysis_progress(1, 1, "Computing metrics")
+            self.last_per_body_rows = list(self._last_bundle_per_body_rows)
             self._set_result_text_from_metrics(
                 self.last_metrics, prefix="Full image metrics:\n"
             )
@@ -2698,19 +3644,37 @@ class OrganelleContactWidget(QWidget):
 
         self._last_contacts_display = contacts_display
 
-        if self.show_thresh_after_checkbox.isChecked():
-            for i in range(n):
+        # Which layers to auto-display, per channel and layer type,
+        # configured via the "Auto-Display Setup" dialog
+        # (DisplayLayersDialog) -- see self.display_layers_selection.
+        sel = self.display_layers_selection
+        thresh_sel = sel.get("thresholded", [])
+        body_sel = sel.get("body_labels", [])
+        skel_sel = sel.get("skeleton", [])
+        junc_sel = sel.get("junctions", [])
+        collapsed_sel = sel.get("collapsed", [])
+        for i in range(n):
+            if i < len(thresh_sel) and thresh_sel[i]:
                 self.show_thresholded_channel(i)
-
-        if self.show_body_labels_after_checkbox.isChecked():
-            for i in range(n):
+        for i in range(n):
+            if i < len(body_sel) and body_sel[i]:
                 self.show_body_labels_channel(i)
+        for i in range(n):
+            show_skel = i < len(skel_sel) and skel_sel[i]
+            show_junc = i < len(junc_sel) and junc_sel[i]
+            show_collapsed = i < len(collapsed_sel) and collapsed_sel[i]
+            if show_skel or show_junc or show_collapsed:
+                self._set_analysis_progress_message(
+                    f"Rendering skeleton: channel {i + 1}/{n}"
+                )
+                self.show_skeleton_channel(
+                    i,
+                    show_skeleton=show_skel,
+                    show_junctions=show_junc,
+                    show_collapsed=show_collapsed,
+                )
 
-        if self.show_skeleton_after_checkbox.isChecked():
-            for i in range(n):
-                self.show_skeleton_channel(i)
-
-        if self.show_contacts_after_checkbox.isChecked():
+        if sel.get("contacts", True):
             self._update_contacts_layer(contacts_display, base_layer)
 
     def _region_mask_from_mode(
@@ -2780,6 +3744,73 @@ class OrganelleContactWidget(QWidget):
             int(np.sum(filtered_binary)),
         )
 
+    @staticmethod
+    def _fill_small_holes(
+        binary_mask: np.ndarray, max_hole_size: int
+    ) -> np.ndarray:
+        """Fill background holes (fully-enclosed pockets of False
+        inside a body) up to ``max_hole_size`` pixels/voxels, leaving
+        larger holes untouched. ``max_hole_size`` <= 0 is a no-op.
+
+        Motivation: ``skimage.morphology.skeletonize`` computes a true
+        topological medial axis, and the medial axis of a shape with a
+        hole in it is a closed loop running around that hole. A mask
+        riddled with tiny thresholding-noise holes therefore produces
+        a skeleton that's mostly small spurious rings around that
+        noise rather than the network's real branch structure -- and
+        each ring merging into the surrounding skeleton is a genuine
+        (if spurious) graph junction as far as any topology-based
+        analysis is concerned, inflating Branch/Junction Count. The
+        same tiny holes also distort
+        Aspect Ratio/Form Factor (they add to a body's perimeter and
+        shift its inertia tensor) without representing anything
+        biologically meaningful at that scale. Filling them first
+        fixes both.
+
+        Background is labeled with full/diagonal connectivity
+        (deliberately denser than the face-only connectivity used for
+        body labeling) so a hole connected to the array border only
+        through a diagonal gap isn't mistaken for a fully-enclosed
+        hole. Filling holes never changes which foreground pixels are
+        connected to which -- it only adds pixels strictly inside an
+        already-connected body -- so body count/labeling/order is
+        unaffected; this is safe to apply before Morphology Shape/
+        Network without disturbing Body Count or Fragmentation
+        Coefficient (which deliberately keep using the unfilled mask).
+        Returns a new array; ``binary_mask`` is not modified."""
+        if max_hole_size <= 0 or not np.any(binary_mask):
+            return binary_mask
+        ndim = binary_mask.ndim
+        struct = np.ones((3,) * ndim, dtype=int)
+        background = ~binary_mask
+        bg_labels, n_bg = ndi_label(background, structure=struct)
+        if n_bg == 0:
+            return binary_mask
+
+        border_labels: set = set()
+        for axis in range(ndim):
+            for edge in (0, -1):
+                slicer = [slice(None)] * ndim
+                slicer[axis] = edge
+                border_labels.update(
+                    np.unique(bg_labels[tuple(slicer)]).tolist()
+                )
+        border_labels.discard(0)
+
+        sizes = np.bincount(bg_labels.ravel(), minlength=n_bg + 1)
+        fill_ids = [
+            lbl
+            for lbl in range(1, n_bg + 1)
+            if lbl not in border_labels and sizes[lbl] <= max_hole_size
+        ]
+        if not fill_ids:
+            return binary_mask
+
+        fill_mask = np.isin(bg_labels, fill_ids)
+        filled = binary_mask.copy()
+        filled[fill_mask] = True
+        return filled
+
     def _labeled_bodies_for_metrics(
         self, mask: np.ndarray
     ) -> Tuple[np.ndarray, int, int, np.ndarray]:
@@ -2807,31 +3838,729 @@ class OrganelleContactWidget(QWidget):
         return labels, int(n_bodies), int(signal_area), binary
 
     @staticmethod
-    def _skeleton_and_junctions(
+    def _wide_region_labels(
         binary_mask: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """Skeletonize ``binary_mask`` to a 1-pixel-wide medial axis,
-        then classify skeleton pixels by neighbor count *within the
-        skeleton*, using full/diagonal connectivity (deliberately
-        denser than the face-only connectivity used for body labeling,
-        since a thinned skeleton can zigzag diagonally and a junction
-        can be missed under face-only connectivity): >=3 neighbors
-        marks a junction/branch point. Returns (skeleton, junction_mask)
-        -- both boolean arrays the same shape as ``binary_mask``. Shared
-        by the Morphology Network metrics and the Skeleton layer
-        visualization, so what's counted and what's displayed always
-        match."""
-        skel = skeletonize(binary_mask)
-        if not np.any(skel):
-            return skel, np.zeros_like(skel, dtype=bool)
-        ndim = skel.ndim
-        struct = np.ones((3,) * ndim, dtype=int)
-        struct[tuple(1 for _ in range(ndim))] = 0
-        neighbor_count = ndi_convolve(
-            skel.astype(np.uint8), struct, mode="constant", cval=0
+        spacing: Tuple[float, ...],
+        max_width: float,
+    ) -> Optional[np.ndarray]:
+        """Label connected patches of ``binary_mask`` that are locally
+        too wide to be a filament -- e.g. a genuinely swollen/globular
+        stretch of an otherwise-reticular mitochondrial network. Unlike
+        an earlier whole-body version of this idea, this operates at
+        SUB-body granularity: a single connected body can contain both
+        thin tubules (never flagged) and a locally wide, blob-like
+        stretch (flagged), because real reticular networks often mix
+        both in one connected structure -- flagging the whole body
+        would incorrectly discard the thin tubule parts along with it.
+
+        "Local width" at a pixel is 2x the distance-transform value
+        there -- the diameter of the largest circle (or sphere, in 3D)
+        that fits at that point, i.e. how thick the mask is right there,
+        not the body's overall length. ``spacing`` uses the same
+        relative Z/XY calibration ratio as everywhere else in
+        Morphology Network.
+
+        Returns an int array the same shape as ``binary_mask`` (0 =
+        not part of any wide patch, 1..k = which of the k connected
+        wide patches a pixel belongs to), or None if ``max_width`` <= 0
+        (feature off) or nothing in the mask exceeds it. Consumed by
+        ``_skan_network_analysis`` (to union-find-merge every skeleton
+        node inside one patch into a single junction, and drop branches
+        entirely internal to a patch from Branch Count/Length) and by
+        the Skeleton visualization (to highlight which pixels fall
+        inside an active collapse patch)."""
+        if max_width <= 0 or not np.any(binary_mask):
+            return None
+        dist = distance_transform_edt(binary_mask, sampling=spacing)
+        wide_pixels = (2.0 * dist) > max_width
+        if not np.any(wide_pixels):
+            return None
+        region_labels, n_regions = ndi_label(wide_pixels)
+        if n_regions == 0:
+            return None
+        return region_labels
+
+    def _skan_network_analysis(
+        self,
+        binary_mask: np.ndarray,
+        labels_i: np.ndarray,
+        n_bodies_i: int,
+        spacing: Tuple[float, ...],
+        prune_length: float,
+        collapse_length: float = 0.0,
+        max_width: float = 0.0,
+        cluster_radius: float = 0.0,
+        loop_radius: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Skeletonize ``binary_mask`` and analyze its branch/junction
+        network with skan (https://skeleton-analysis.org), replacing
+        an earlier hand-rolled approach that classified skeleton
+        pixels by neighbor count and then merged nearby
+        junction-flagged *pixels* via connected-component clustering.
+        That pixel-clustering step could under-count Junction Count on
+        dense, tangled networks: two genuinely distinct branch points
+        sitting close together (common in a complex reticular network)
+        could have their few-pixel "junction blobs" touch and get
+        merged into a single reported junction. skan instead builds a
+        proper graph over the skeleton's own pixel adjacency
+        (``skan.Skeleton``), and ``skan.summarize()`` traces that graph
+        into one row per branch with its endpoints, type, and true
+        physical length (via ``spacing``) -- so junction identity
+        comes from real skeleton topology, not from how close two
+        pixel blobs happen to sit.
+
+        A branch "node" here is anything skan's summarize() table
+        references as a branch endpoint (``node_id_src``/
+        ``node_id_dst``); a node referenced by only 1 branch-endpoint
+        slot across the whole table is a free endpoint (degree 1), one
+        referenced >=3 times is a true junction (degree >=3). This
+        mirrors each node's real degree in the skeleton graph without
+        depending on any skan-version-specific "is this a junction"
+        column -- only on the src/dst node-id and coordinate columns,
+        whose names are looked up defensively across the naming
+        conventions skan has used (hyphen-separated pre-0.13,
+        underscore-separated 0.13+).
+
+        Spur pruning (``prune_length`` > 0): branches skan classifies
+        as branch_type==1 ("junction-to-endpoint", i.e. a spur)
+        shorter than ``prune_length`` are removed from the skeleton
+        *pixel array* -- except the junction-end pixel itself, which
+        other branches may still need -- and skan is re-run once on
+        the pruned array so surviving junctions are correctly
+        reclassified (a junction that only had that one spur attached,
+        plus two real branches, is no longer degree >=3 once the
+        spur's connection is gone). Single pass, mirroring the design
+        of the pruning step this replaced -- see the Limitations
+        reference. ``prune_length`` <= 0 is a no-op.
+
+        Bridge collapsing (``collapse_length`` > 0, applied after any
+        spur pruning above): branches skan classifies as
+        branch_type==2 ("junction-to-junction") shorter than
+        ``collapse_length`` are treated as two junctions that are
+        really one -- the classic pattern from a single irregular/wide
+        spot on a jagged mask boundary, where skeletonize resolves it
+        as two closely-spaced junctions joined by a short bridge
+        instead of one clean junction. Unlike spur pruning, this is
+        done purely at the graph level via union-find over node ids,
+        *not* by touching skeleton pixels: a collapsed bridge is
+        excluded from Branch Count/Branch Length (it's absorbed into
+        the merged junction, not a real branch), and every junction
+        node unioned together by one or more collapsed bridges is
+        reported as a single junction, placed at the average position
+        of the distinct original nodes in that group -- degree is
+        recomputed per group from surviving (non-collapsed) branches
+        only, so a group's junction status correctly accounts for the
+        bridge(s) it absorbed. The skeleton pixel array itself, and
+        every other branch touching either original junction, are left
+        completely unchanged -- only what's counted and where the
+        merged marker is placed changes. ``collapse_length`` <= 0 is a
+        no-op and reproduces the pre-collapse result exactly (every
+        node is its own singleton group).
+
+        Wide-region collapsing (``max_width`` > 0, applied alongside
+        bridge collapsing above -- both feed the same union-find):
+        handles a genuinely reticular network that also contains a
+        locally wide, swollen/globular stretch (e.g. a real swollen
+        mitochondrion embedded in an otherwise thin, branching network
+        -- NOT a separate blob body). Skeletonizing a wide region
+        produces a dense maze of many closely-spaced junctions/branches
+        that don't correspond to real distinct branch points; via
+        ``_wide_region_labels``, every skeleton node whose coordinate
+        falls inside the same connected wide patch is union-find-merged
+        into one group (regardless of branch length/type, unlike
+        bridge collapsing above), and any branch whose *both* endpoints
+        fall inside that same patch is absorbed (excluded from Branch
+        Count/Branch Length) the same way a collapsed bridge is. A
+        branch with only one endpoint inside the patch -- a real
+        tubule connecting the swollen region to the rest of the
+        network -- is left as a normal, fully-counted branch, so the
+        network stays connected and the swollen region is represented
+        as a single junction (only counted as one if 3+ such real
+        branches survive touching it -- with just 1-2, it's correctly
+        treated as an ordinary point along a path, not a branch point).
+        As with bridge collapsing, skeleton pixels are never touched --
+        only what's counted and where merged junction markers are
+        placed. One caveat worth knowing: a surviving branch's length
+        still includes whatever distance the raw skeleton traced
+        *inside* the patch before reaching its node there, so Branch
+        Length for branches touching a collapsed region can slightly
+        overstate the real external tubule length. ``max_width`` <= 0
+        is a no-op.
+
+        Junction-cluster collapsing (``cluster_radius`` > 0, applied
+        alongside both mechanisms above -- all three feed the same
+        union-find): handles a convoluted patch that ISN'T locally
+        wide by the mask-thickness measure above -- e.g. a dense tangle
+        of many genuinely thin strands crammed into a small physical
+        area, which skeletonizes into a maze of many true (degree>=3)
+        junction nodes sitting close together, without the underlying
+        mask ever being especially thick anywhere. Unlike wide-region
+        collapsing, this doesn't look at mask width at all: every node
+        skan classifies as a real junction (degree >=3 in the raw,
+        pre-collapse graph) is found, and any two such junction nodes
+        within ``cluster_radius`` of each other (straight-line
+        distance, spacing-aware, via a KD-tree over just the junction
+        nodes -- not every skeleton pixel) are union-find-merged into
+        one group, regardless of whether a branch directly connects
+        them or how many hops apart they are in the graph. As with the
+        other two mechanisms, any branch whose two endpoints end up in
+        the same merged group afterward is absorbed (dropped from
+        Branch Count/Branch Length); a branch reaching a node outside
+        the group survives normally. This is the right tool when a
+        convoluted region and the network's genuinely thin, healthy
+        tubules don't separate on width at all (raising ``max_width``
+        catches real tubules right along with the tangle) -- density of
+        real junction points is a different, often better-separated
+        signal in that case. The obvious risk: two real, distinct
+        branch points that just happen to sit near each other in
+        physical space (not because they're part of the same tangle,
+        but because two separate strands of the network cross nearby)
+        could get incorrectly merged -- pick a radius small enough that
+        only a genuinely dense pileup of many junctions falls within it
+        of each other, not two isolated crossing branches. Skeleton
+        pixels are never touched here either. ``cluster_radius`` <= 0
+        is a no-op.
+
+        Maze/loop-density collapsing (``loop_radius`` > 0, applied
+        alongside all three mechanisms above -- all four feed the same
+        union-find): handles the case where neither mask width nor raw
+        junction spacing reliably separates a maze/crosshatch artifact
+        from real branching -- both properties can overlap between the
+        two in a given image. This instead measures local LOOP
+        density, a different topological signal: a maze is
+        characterized by many small closed loops packed into a small
+        area (like a woven mesh), whereas real branching -- even where
+        it's dense -- tends to stay much more tree-like, with far
+        fewer nearby loops. Every independent loop in the (already
+        collapsed-so-far) graph is found via a Kruskal-style pass: a
+        FRESH union-find processes every branch in order, and any
+        branch whose two endpoints are already connected (via some
+        other path) closes a loop -- its two endpoints are that loop's
+        "loop nodes". Loop nodes from 2 or more DISTINCT loops that lie
+        within ``loop_radius`` of each other (spacing-aware, via a
+        KD-tree, mirroring cluster_radius's approach) are union-find-
+        merged into one group; a single loop found in isolation (no
+        other loop nearby -- e.g. one real, biologically meaningful
+        closed ring-shaped structure) is deliberately left alone, since
+        the point is to catch a *pileup* of loops, not any one loop on
+        its own. As with the other mechanisms, a branch is absorbed if
+        both endpoints land in the same merged group; skeleton pixels
+        are never touched. ``loop_radius`` <= 0 is a no-op.
+
+        All four collapsing mechanisms above feed one shared
+        union-find structure, and a branch is absorbed from Branch
+        Count/Branch Length if its two endpoints end up in the same
+        group by ANY combination of bridge/region/cluster/loop merges
+        (checked once, after all unions are applied, rather than
+        tracking a separate flag per mechanism) -- so e.g. a chain
+        A-collapsed-into-B via a short bridge, B-collapsed-into-C via a
+        shared wide region, correctly absorbs a hypothetical direct
+        branch from A to C too, not just the original A-B/B-C branches.
+
+        Returns a dict with:
+        - "skeleton": the (possibly pruned) skeleton, boolean array
+          the same shape as ``binary_mask`` -- for the Skeleton
+          visualization layer.
+        - "junction_coords": (n_junctions, ndim) pixel-index
+          coordinates of each junction node -- for the Junctions
+          visualization layer.
+        - "collapsed_pixel_mask": boolean array the same shape as
+          ``binary_mask`` -- every skeleton pixel belonging to a branch
+          absorbed by ANY of the three collapsing mechanisms above
+          (bridge, wide-region, or junction-cluster), for the Skeleton
+          visualization's diagnostic collapsed-branches overlay.
+        - "branch_counts", "junction_counts", "branch_len_totals",
+          "body_areas": float arrays of length ``n_bodies_i + 1``
+          (index 0 unused, index ``bid`` = body ``bid``), matching
+          what _compute_metrics_bundle's Morphology Network block
+          expects.
+
+        Any exception here (including a skan API mismatch on an
+        unexpectedly old/new installed version) is left to propagate
+        to the caller, which already wraps this in a
+        try/except-and-warn -- consistent with the rest of Morphology
+        Network's error handling."""
+        ndim = binary_mask.ndim
+
+        def _col(df, *names):
+            for name in names:
+                if name in df.columns:
+                    return df[name].to_numpy()
+            raise KeyError(
+                f"None of {names} found in skan summarize() output "
+                f"(columns: {list(df.columns)}); skan's column naming "
+                f"may have changed -- check the installed skan version."
+            )
+
+        def _run_skan(sk_img):
+            if not np.any(sk_img):
+                return None, None
+            sk_obj = SkanSkeleton(sk_img, spacing=spacing)
+            if sk_obj.n_paths == 0:
+                return sk_obj, None
+            try:
+                df = skan_summarize(sk_obj, separator="_")
+            except TypeError:
+                df = skan_summarize(sk_obj)
+            return sk_obj, df.reset_index(drop=True)
+
+        branch_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
+        junction_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
+        branch_len_totals = np.zeros(n_bodies_i + 1, dtype=np.float64)
+        body_areas = np.zeros(n_bodies_i + 1, dtype=np.float64)
+        if n_bodies_i > 0:
+            areas_full = np.bincount(
+                labels_i.ravel(), minlength=n_bodies_i + 1
+            )
+            body_areas[: len(areas_full)] = areas_full
+
+        # Computed from the mask, not the skeleton, so it doesn't
+        # depend on spur pruning/collapsing below -- a locally wide
+        # patch is a property of the underlying shape.
+        wide_region_labels = self._wide_region_labels(
+            binary_mask, spacing, max_width
         )
-        junction_mask = skel & (neighbor_count >= 3)
-        return skel, junction_mask
+
+        def _zero_result(skel_arr):
+            return {
+                "skeleton": skel_arr,
+                "junction_coords": np.zeros((0, ndim), dtype=float),
+                "collapsed_pixel_mask": np.zeros_like(skel_arr, dtype=bool),
+                "branch_counts": branch_counts,
+                "junction_counts": junction_counts,
+                "branch_len_totals": branch_len_totals,
+                "body_areas": body_areas,
+            }
+
+        if n_bodies_i == 0:
+            return _zero_result(np.zeros_like(binary_mask, dtype=bool))
+
+        skel = skeletonize(binary_mask)
+        sk_obj, df = _run_skan(skel)
+        if df is None:
+            return _zero_result(skel)
+
+        # --- optional spur pruning ---
+        if prune_length > 0:
+            branch_dist = _col(df, "branch_distance", "branch-distance")
+            branch_type = _col(df, "branch_type", "branch-type")
+            node_src = _col(df, "node_id_src", "node-id-src").astype(int)
+            node_dst = _col(df, "node_id_dst", "node-id-dst").astype(int)
+            # Junction/endpoint coordinates read straight from the
+            # dataframe's own image-coordinate columns, deliberately
+            # *not* via sk_obj.coordinates[node_id] -- that array's
+            # indexing convention relative to node ids isn't
+            # documented clearly enough to trust blindly (skan's own
+            # docs note some of its entries "are non-sensical" outside
+            # specific access patterns), whereas these columns are
+            # exactly what the getting-started tutorial demonstrates.
+            src_coord_cols = [
+                _col(df, f"image_coord_src_{d}", f"image-coord-src-{d}")
+                for d in range(ndim)
+            ]
+            dst_coord_cols = [
+                _col(df, f"image_coord_dst_{d}", f"image-coord-dst-{d}")
+                for d in range(ndim)
+            ]
+            spur_positions = np.where(
+                (branch_type == 1) & (branch_dist < prune_length)
+            )[0]
+            if len(spur_positions) > 0:
+                node_counts: Dict[int, int] = {}
+                for nid in np.concatenate([node_src, node_dst]):
+                    nid = int(nid)
+                    node_counts[nid] = node_counts.get(nid, 0) + 1
+
+                remove_mask = np.zeros_like(skel, dtype=bool)
+                for pos in spur_positions:
+                    path_coords = sk_obj.path_coordinates(int(pos))
+                    src_id, dst_id = int(node_src[pos]), int(node_dst[pos])
+                    src_is_junction = node_counts.get(src_id, 0) >= 3
+                    junction_coord = tuple(
+                        int(round(col[pos]))
+                        for col in (
+                            src_coord_cols if src_is_junction
+                            else dst_coord_cols
+                        )
+                    )
+                    for coord in path_coords:
+                        pixel = tuple(int(round(c)) for c in coord)
+                        if pixel == junction_coord:
+                            continue
+                        remove_mask[pixel] = True
+                skel = skel & ~remove_mask
+                sk_obj, df = _run_skan(skel)
+                if df is None:
+                    return _zero_result(skel)
+
+        # --- extract final branch/junction structure ---
+        branch_dist = _col(df, "branch_distance", "branch-distance")
+        branch_type = _col(df, "branch_type", "branch-type")
+        node_src = _col(df, "node_id_src", "node-id-src").astype(int)
+        node_dst = _col(df, "node_id_dst", "node-id-dst").astype(int)
+        coord_src = np.stack(
+            [
+                _col(df, f"image_coord_src_{d}", f"image-coord-src-{d}")
+                for d in range(ndim)
+            ],
+            axis=1,
+        )
+        coord_dst = np.stack(
+            [
+                _col(df, f"image_coord_dst_{d}", f"image-coord-dst-{d}")
+                for d in range(ndim)
+            ],
+            axis=1,
+        )
+
+        node_coord: Dict[int, Tuple[int, ...]] = {}
+        for nid_arr, coord_arr in (
+            (node_src, coord_src),
+            (node_dst, coord_dst),
+        ):
+            for row, nid in enumerate(nid_arr):
+                nid = int(nid)
+                if nid not in node_coord:
+                    node_coord[nid] = tuple(
+                        int(round(v)) for v in coord_arr[row]
+                    )
+
+        # Union-find over node ids: every collapsing mechanism below
+        # (bridge, wide-region, junction-cluster) unions node ids into
+        # this same structure; a branch is absorbed if its two
+        # endpoints end up in the same group by ANY combination of
+        # them, checked once at the end (see "unified absorption check"
+        # below) rather than tracked per-mechanism -- everything stays
+        # its own singleton group, and no branch is ever absorbed, if
+        # all three thresholds are 0 (reproduces the pre-collapse
+        # result exactly).
+        parent: Dict[int, int] = {}
+
+        def _find(x: int) -> int:
+            root = x
+            while parent.get(root, root) != root:
+                root = parent[root]
+            while parent.get(x, x) != root:
+                parent[x], x = root, parent.get(x, x)
+            return root
+
+        def _union(a: int, b: int) -> None:
+            ra, rb = _find(a), _find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # --- bridge collapsing ---
+        if collapse_length > 0:
+            bridge_eligible = (branch_type == 2) & (
+                branch_dist < collapse_length
+            )
+            for row in np.where(bridge_eligible)[0]:
+                _union(int(node_src[row]), int(node_dst[row]))
+
+        shape = labels_i.shape
+
+        # --- wide-region collapsing: every node whose coordinate falls
+        # inside the same connected wide patch gets merged together
+        # (regardless of branch length/type -- a maze can have many
+        # nodes in a patch with no single short bridge directly
+        # connecting all of them pairwise). ---
+        if wide_region_labels is not None:
+            def _region_at(coord: Tuple[int, ...]) -> int:
+                if all(0 <= c < s for c, s in zip(coord, shape)):
+                    return int(wide_region_labels[coord])
+                return 0
+
+            node_region: Dict[int, int] = {
+                nid: _region_at(coord) for nid, coord in node_coord.items()
+            }
+            region_to_nodes: Dict[int, List[int]] = {}
+            for nid, rid in node_region.items():
+                if rid > 0:
+                    region_to_nodes.setdefault(rid, []).append(nid)
+            for nids in region_to_nodes.values():
+                for nid in nids[1:]:
+                    _union(nids[0], nid)
+
+        # --- junction-cluster collapsing: any two real (degree>=3)
+        # junction nodes within cluster_radius of each other (straight-
+        # line, spacing-aware distance, via a KD-tree over just the
+        # junction nodes) get merged -- independent of mask width, and
+        # independent of whether a branch directly connects them. ---
+        if cluster_radius > 0:
+            degree_counts: Dict[int, int] = {}
+            for nid in np.concatenate([node_src, node_dst]):
+                nid = int(nid)
+                degree_counts[nid] = degree_counts.get(nid, 0) + 1
+            candidates = [
+                nid for nid, deg in degree_counts.items() if deg >= 3
+            ]
+            if len(candidates) >= 2:
+                coords_arr = np.array(
+                    [node_coord[nid] for nid in candidates], dtype=float
+                )
+                scaled = coords_arr * np.asarray(spacing, dtype=float)
+                tree = cKDTree(scaled)
+                for a, b in tree.query_pairs(r=cluster_radius):
+                    _union(candidates[a], candidates[b])
+
+        # --- maze/loop-density collapsing: find every independent loop
+        # in the graph (a Kruskal-style pass over a FRESH, separate
+        # union-find -- any branch whose endpoints are already
+        # connected via some other path closes a loop; its two
+        # endpoints are that loop's "loop nodes"), then spatially
+        # cluster loop nodes the same way junction-cluster clusters
+        # junction nodes -- except a cluster only counts if it pulls
+        # together loop nodes from 2+ DISTINCT loops. A single loop
+        # found in isolation (nothing else nearby) is deliberately left
+        # alone: the goal is catching a pileup of loops, not any one
+        # real loop on its own. ---
+        if loop_radius > 0 and len(branch_dist) > 0:
+            cyc_parent: Dict[int, int] = {}
+
+            def _cyc_find(x: int) -> int:
+                root = x
+                while cyc_parent.get(root, root) != root:
+                    root = cyc_parent[root]
+                while cyc_parent.get(x, x) != root:
+                    cyc_parent[x], x = root, cyc_parent.get(x, x)
+                return root
+
+            def _cyc_union(a: int, b: int) -> bool:
+                ra, rb = _cyc_find(a), _cyc_find(b)
+                if ra == rb:
+                    return False
+                cyc_parent[ra] = rb
+                return True
+
+            # Kruskal-style pass: every edge that DOESN'T close a loop
+            # (i.e. its two endpoints weren't already connected) is a
+            # spanning-tree edge, recorded here so each qualifying
+            # loop's FULL set of nodes -- not just its closing edge's 2
+            # endpoints -- can be reconstructed below via a tree-path
+            # walk. loop_edges[k] = (src, dst) of the k-th independent
+            # loop's closing branch.
+            #
+            # Processed SHORTEST-first (true Kruskal order), not in
+            # whatever order skan's table happens to list branches:
+            # which edges end up "closing" a loop vs. being absorbed
+            # into the tree is order-dependent, and shortest-first makes
+            # the tree greedily soak up short/local edges before longer
+            # ones, so a small local loop's closing edge is preferentially
+            # one of ITS OWN short edges (a well-localized representative
+            # point for clustering) rather than some longer edge that
+            # happens to close a large, spatially-spread-out loop instead.
+            row_order = np.argsort(branch_dist)
+            tree_adj: Dict[int, List[int]] = {}
+            loop_edges: List[Tuple[int, int]] = []
+            for row in row_order:
+                row = int(row)
+                s, d = int(node_src[row]), int(node_dst[row])
+                if _cyc_union(s, d):
+                    tree_adj.setdefault(s, []).append(d)
+                    tree_adj.setdefault(d, []).append(s)
+                else:
+                    loop_edges.append((s, d))
+
+            if len(loop_edges) >= 2:
+                # Spatial representative for each loop = its closing
+                # edge's 2 endpoints only (cheap; a reasonable stand-in
+                # for "where is this loop" without walking its full
+                # path yet -- full paths are only reconstructed below,
+                # and only for loops that actually turn out to qualify).
+                loop_nodes: List[int] = []
+                for s, d in loop_edges:
+                    loop_nodes.append(s)
+                    loop_nodes.append(d)
+
+                coords_arr = np.array(
+                    [node_coord[nid] for nid in loop_nodes], dtype=float
+                )
+                scaled = coords_arr * np.asarray(spacing, dtype=float)
+                tree = cKDTree(scaled)
+                pairs = list(tree.query_pairs(r=loop_radius))
+
+                # Scratch union-find over loop_nodes POSITIONS (0..
+                # len(loop_nodes)-1), separate from every other
+                # union-find here -- only used to figure out which
+                # spatial clusters involve 2+ distinct loops before
+                # touching the real (shared) union-find at all.
+                scratch_parent: Dict[int, int] = {}
+
+                def _scr_find(x: int) -> int:
+                    root = x
+                    while scratch_parent.get(root, root) != root:
+                        root = scratch_parent[root]
+                    while scratch_parent.get(x, x) != root:
+                        scratch_parent[x], x = root, scratch_parent.get(
+                            x, x
+                        )
+                    return root
+
+                def _scr_union(a: int, b: int) -> None:
+                    ra, rb = _scr_find(a), _scr_find(b)
+                    if ra != rb:
+                        scratch_parent[ra] = rb
+
+                for a, b in pairs:
+                    _scr_union(a, b)
+
+                group_loop_ids: Dict[int, set] = {}
+                for pos in range(len(loop_nodes)):
+                    loop_id = pos // 2
+                    g = _scr_find(pos)
+                    group_loop_ids.setdefault(g, set()).add(loop_id)
+
+                qualifying_groups = {
+                    g for g, ids in group_loop_ids.items() if len(ids) >= 2
+                }
+                # Link each qualifying loop's closing-edge endpoints to
+                # every other nearby qualifying loop's.
+                for a, b in pairs:
+                    if _scr_find(a) in qualifying_groups:
+                        _union(loop_nodes[a], loop_nodes[b])
+
+                # Now expand: pull in EVERY node on each qualifying
+                # loop's actual cycle (not just its closing edge's 2
+                # endpoints), so e.g. a branch that's part of the loop
+                # but isn't the closing edge itself still gets absorbed
+                # below -- otherwise most of a collapsed loop's own
+                # branches would incorrectly survive as "real."
+                qualifying_loop_ids = {
+                    loop_id
+                    for g in qualifying_groups
+                    for loop_id in group_loop_ids[g]
+                }
+
+                def _tree_path(a: int, b: int) -> List[int]:
+                    # BFS on tree_adj (spanning-tree edges only) from a
+                    # to b -- guaranteed to exist and be unique, since a
+                    # and b were already connected (via tree edges
+                    # alone) by the time this loop's closing edge was
+                    # processed above.
+                    if a == b:
+                        return [a]
+                    prev: Dict[int, Optional[int]] = {a: None}
+                    queue = [a]
+                    qi = 0
+                    while qi < len(queue):
+                        cur = queue[qi]
+                        qi += 1
+                        if cur == b:
+                            break
+                        for nxt in tree_adj.get(cur, ()):
+                            if nxt not in prev:
+                                prev[nxt] = cur
+                                queue.append(nxt)
+                    if b not in prev:
+                        return [a, b]  # defensive; shouldn't happen
+                    path = []
+                    node: Optional[int] = b
+                    while node is not None:
+                        path.append(node)
+                        node = prev[node]
+                    return path
+
+                for loop_id in qualifying_loop_ids:
+                    s, d = loop_edges[loop_id]
+                    path_nodes = _tree_path(s, d)
+                    for n in path_nodes[1:]:
+                        _union(path_nodes[0], n)
+
+        # --- unified absorption check: after every mechanism above has
+        # had a chance to union nodes, a branch is absorbed (excluded
+        # from Branch Count/Branch Length) if its two endpoints now sit
+        # in the same union-find group, no matter which mechanism (or
+        # combination/chain of mechanisms) put them there. ---
+        if len(branch_dist) > 0:
+            collapsed = np.array(
+                [
+                    _find(int(node_src[row])) == _find(int(node_dst[row]))
+                    for row in range(len(branch_dist))
+                ],
+                dtype=bool,
+            )
+        else:
+            collapsed = np.zeros(0, dtype=bool)
+
+        # Diagnostic-overlay mask: every skeleton pixel belonging to an
+        # absorbed branch's own traced path, from ANY of the three
+        # collapsing mechanisms above (bridge, wide-region, or
+        # junction-cluster combined) -- so the Skeleton visualization's
+        # overlay layer always shows exactly what's being folded out of
+        # Branch Count/Branch Length right now, regardless of which
+        # control(s) are responsible. Built from the same
+        # ``sk_obj.path_coordinates`` used by spur pruning above; a
+        # branch's own endpoint pixel is included like every other
+        # pixel on its path (unlike spur pruning, this never removes
+        # pixels from ``skel`` itself, only flags them for display).
+        collapsed_pixel_mask = np.zeros_like(skel, dtype=bool)
+        for row in np.where(collapsed)[0]:
+            for coord in sk_obj.path_coordinates(int(row)):
+                pixel = tuple(int(round(c)) for c in coord)
+                collapsed_pixel_mask[pixel] = True
+
+        # Branch Count/Length: every *surviving* branch, attributed to
+        # a body via its own src coordinate -- a collapsed bridge is
+        # absorbed into its merged junction and no longer counted as a
+        # branch in its own right.
+        for row in range(len(branch_dist)):
+            if collapsed[row]:
+                continue
+            coord = tuple(int(round(v)) for v in coord_src[row])
+            if all(0 <= c < s for c, s in zip(coord, shape)):
+                body_id = int(labels_i[coord])
+                if 1 <= body_id <= n_bodies_i:
+                    branch_counts[body_id] += 1.0
+                    branch_len_totals[body_id] += float(branch_dist[row])
+
+        # Junction Count: degree recomputed per union-find group from
+        # surviving branches only (a collapsed bridge's own two
+        # endpoint references don't count toward it), so a group that
+        # absorbed a bridge is judged on what's left touching it, not
+        # on the bridge itself. A group with >=3 surviving references
+        # is a junction, placed at the average position of the
+        # distinct original nodes folded into it (a single, unmerged
+        # node's "average" is just its own coordinate).
+        group_counts: Dict[int, int] = {}
+        group_nodes: Dict[int, set] = {}
+        for row in range(len(branch_dist)):
+            if collapsed[row]:
+                continue
+            for nid in (int(node_src[row]), int(node_dst[row])):
+                gid = _find(nid)
+                group_counts[gid] = group_counts.get(gid, 0) + 1
+                group_nodes.setdefault(gid, set()).add(nid)
+
+        junction_coords_list = []
+        for gid, count in group_counts.items():
+            if count < 3:
+                continue
+            member_coords = [node_coord[nid] for nid in group_nodes[gid]]
+            centroid = tuple(
+                int(round(float(np.mean([c[d] for c in member_coords]))))
+                for d in range(ndim)
+            )
+            if all(0 <= c < s for c, s in zip(centroid, shape)):
+                junction_coords_list.append(centroid)
+                body_id = int(labels_i[centroid])
+                if 1 <= body_id <= n_bodies_i:
+                    junction_counts[body_id] += 1.0
+
+        junction_coords = (
+            np.array(junction_coords_list, dtype=float)
+            if junction_coords_list
+            else np.zeros((0, ndim), dtype=float)
+        )
+
+        return {
+            "skeleton": skel,
+            "junction_coords": junction_coords,
+            "collapsed_pixel_mask": collapsed_pixel_mask,
+            "branch_counts": branch_counts,
+            "junction_counts": junction_counts,
+            "branch_len_totals": branch_len_totals,
+            "body_areas": body_areas,
+        }
 
     @staticmethod
     def _mean_sd_wmean(
@@ -2861,9 +4590,33 @@ class OrganelleContactWidget(QWidget):
         ch_labels: List[str],
         roi_poly_data: Optional[np.ndarray],
         roi_area: Optional[int],
+        z_xy_ratio: float = 1.0,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, Any]:
         n = len(masks)
         out: Dict[str, Any] = {}
+
+        def _report(msg: str) -> None:
+            # Optional -- callers outside analyze_contacts (e.g. tests)
+            # don't need to supply one. Also pumps the Qt event loop
+            # via the callback, which is what keeps napari's window
+            # responsive during Morphology Network -- by a wide margin
+            # the slowest per-channel loop below on large 3D stacks.
+            if progress_callback is not None:
+                try:
+                    progress_callback(msg)
+                except Exception:
+                    pass
+
+        # Per-body records (one row per surviving body per channel),
+        # populated by the Morphology Shape / Morphology Network blocks
+        # below (whichever are enabled). Kept separate from ``out``
+        # since ``out`` is one row per analysis/ROI, not one row per
+        # body -- callers (analyze_contacts) read this back
+        # immediately via self._last_bundle_per_body_rows right after
+        # each call, before it gets overwritten by the next channel's
+        # or next ROI's call.
+        per_body_map: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
         intersection = masks[0].copy()
         for m in masks[1:]:
@@ -2929,6 +4682,7 @@ class OrganelleContactWidget(QWidget):
             # already filtered upstream (the "thresholded mask" toggle),
             # this is a no-op: masks[i] is already clean.
             for i in range(n):
+                _report(f"Fragmentation: channel {i + 1}/{n}")
                 _, n_bodies, signal_area, _ = self._labeled_bodies_for_metrics(
                     masks[i]
                 )
@@ -2973,18 +4727,74 @@ class OrganelleContactWidget(QWidget):
             # Form Factor is reported as NaN rather than a misleading
             # 0.0, while Aspect Ratio (based on the 3D inertia tensor)
             # still works normally.
+            #
+            # Voxel calibration: on a 3D (Z-stack) analysis, ``spacing``
+            # is passed to regionprops as (z_xy_ratio, 1.0, 1.0), the
+            # same relative Z/XY calibration ratio used for the Contact
+            # Threshold distance transform (see _get_z_xy_ratio). Without
+            # this, a body that is genuinely round in physical space but
+            # spans fewer voxels along Z than XY (whenever the Z step is
+            # larger than the XY pixel size) would be reported as more
+            # elongated than it actually is, purely as a voxel-grid
+            # artifact. 2D analyses are unaffected (XY pixels are assumed
+            # square; spacing is a no-op there). Wrapped in a
+            # try/except TypeError since ``spacing`` was only added to
+            # regionprops in scikit-image 0.19 -- older installations
+            # silently fall back to the previous, uncalibrated behavior
+            # rather than erroring out.
             for i in range(n):
+                _report(f"Morphology Shape: channel {i + 1}/{n}")
+                # Fill small interior holes (see _fill_small_holes)
+                # before labeling, so Aspect Ratio/Form Factor describe
+                # each body's real macro-scale shape rather than being
+                # distorted by thresholding-noise pockets. Body Count/
+                # Fragmentation Coefficient deliberately keep using the
+                # unfilled masks[i] (via the Fragmentation Metrics block
+                # above, already computed) -- filling holes doesn't
+                # change body count/connectivity either way, only shape.
+                shape_mask_i = self._fill_small_holes(
+                    masks[i], self.max_hole_size_spinbox.value()
+                )
                 labels_i, n_bodies_i, _, _ = self._labeled_bodies_for_metrics(
-                    masks[i]
+                    shape_mask_i
                 )
                 ar_vals: List[float] = []
                 ff_vals: List[float] = []
                 ar_areas: List[float] = []
                 ff_areas: List[float] = []
                 if n_bodies_i > 0:
+                    spacing = (
+                        (float(z_xy_ratio), 1.0, 1.0)
+                        if labels_i.ndim == 3
+                        else None
+                    )
+                    # Raw (uncalibrated) pixel/voxel count per body --
+                    # used for the per-body export's "Area" column, kept
+                    # in the same units as every other Area metric in
+                    # the plugin (see Limitations & Caveats item 1),
+                    # deliberately not the spacing-adjusted regionprops
+                    # area used just above as an internal weight.
+                    body_areas_raw = np.bincount(
+                        labels_i.ravel(), minlength=n_bodies_i + 1
+                    )
+                    for bid in range(1, n_bodies_i + 1):
+                        per_body_map[(i, bid)] = {
+                            "Channel": ch_labels[i],
+                            "Body ID": bid,
+                            "Area": float(body_areas_raw[bid]),
+                        }
                     try:
-                        for rp in regionprops(labels_i):
+                        try:
+                            regionprops_iter = regionprops(
+                                labels_i, spacing=spacing
+                            )
+                        except TypeError:
+                            regionprops_iter = regionprops(labels_i)
+                        for rp in regionprops_iter:
                             area_i = float(rp.area)
+                            body_entry = per_body_map.get(
+                                (i, int(rp.label))
+                            )
                             try:
                                 major = getattr(
                                     rp, "axis_major_length",
@@ -2995,20 +4805,24 @@ class OrganelleContactWidget(QWidget):
                                     getattr(rp, "minor_axis_length", None),
                                 )
                                 if major is not None and minor and minor > 0:
-                                    ar_vals.append(float(major / minor))
+                                    ar_val = float(major / minor)
+                                    ar_vals.append(ar_val)
                                     ar_areas.append(area_i)
+                                    if body_entry is not None:
+                                        body_entry["Aspect Ratio"] = ar_val
                             except Exception:
                                 pass
                             try:
                                 perim = rp.perimeter
                                 if perim is not None and area_i > 0:
-                                    ff_vals.append(
-                                        float(
-                                            (perim ** 2)
-                                            / (4 * np.pi * area_i)
-                                        )
+                                    ff_val = float(
+                                        (perim ** 2)
+                                        / (4 * np.pi * area_i)
                                     )
+                                    ff_vals.append(ff_val)
                                     ff_areas.append(area_i)
+                                    if body_entry is not None:
+                                        body_entry["Form Factor"] = ff_val
                             except Exception:
                                 pass
                     except Exception as e:
@@ -3039,21 +4853,12 @@ class OrganelleContactWidget(QWidget):
                 )
 
         if self.output_selection.get("Morphology Network", False):
-            # Skeleton/graph-based network descriptors. The mask is
-            # skeletonized once per channel (not per body) down to a
-            # 1-pixel-wide medial axis, then every skeleton pixel is
-            # classified by its neighbor count *within the skeleton*,
-            # using full/diagonal connectivity (deliberately denser than
-            # the face-only connectivity used for body labeling, since a
-            # thinned skeleton can zigzag diagonally and a junction can
-            # be missed under face-only connectivity): 1 neighbor =
-            # endpoint, 2 = mid-branch, >=3 = a junction/branch point.
-            #
-            # Branches are found by removing junction pixels and
-            # relabeling what's left; each surviving fragment is one
-            # branch, and its pixel count stands in for branch length
-            # (a pixel-count proxy, not a true Euclidean skeleton-path
-            # length -- see the Metric Descriptions dialog).
+            # Skeleton/graph-based network descriptors, via skan (see
+            # _skan_network_analysis's docstring for why -- it builds
+            # a proper graph over the skeleton's pixel adjacency
+            # instead of clustering nearby junction-flagged pixels, so
+            # closely-spaced true junctions in dense/tangled networks
+            # are correctly kept distinct rather than merged).
             #
             # As with Morphology Shape, both an unweighted mean (per
             # body) and an area-weighted mean are reported, plus two
@@ -3065,8 +4870,29 @@ class OrganelleContactWidget(QWidget):
             # why a naive per-object junction-presence count can be
             # misleading during fragmentation.
             for i in range(n):
+                # By a wide margin the slowest per-channel step in this
+                # method on large/dense 3D stacks (skeletonize + skan's
+                # graph construction) -- report progress before
+                # starting it, not after, so the label doesn't sit on
+                # the *previous* channel's name for however long this
+                # one takes.
+                _report(f"Morphology Network: channel {i + 1}/{n}")
+                # See the Morphology Shape block above for why: fills
+                # tiny thresholding-noise holes so skeletonize traces
+                # the real network instead of a ring around every
+                # noise pocket. Body Count/Fragmentation Coefficient
+                # are unaffected (they use the unfilled masks[i]).
+                network_mask_i = self._fill_small_holes(
+                    masks[i], self.max_hole_size_spinbox.value()
+                )
                 labels_i, n_bodies_i, _, binary_i = (
-                    self._labeled_bodies_for_metrics(masks[i])
+                    self._labeled_bodies_for_metrics(network_mask_i)
+                )
+                ndim = binary_i.ndim
+                spacing = (
+                    (float(z_xy_ratio), 1.0, 1.0)
+                    if ndim == 3
+                    else (1.0, 1.0)
                 )
                 branch_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
                 junction_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
@@ -3077,77 +4903,21 @@ class OrganelleContactWidget(QWidget):
 
                 if n_bodies_i > 0:
                     try:
-                        skel, junction_mask = self._skeleton_and_junctions(
-                            binary_i
+                        result = self._skan_network_analysis(
+                            binary_i,
+                            labels_i,
+                            n_bodies_i,
+                            spacing,
+                            self.prune_branch_length_spinbox.value(),
+                            self.collapse_bridge_length_spinbox.value(),
+                            self.max_local_width_spinbox.value(),
+                            self.collapse_cluster_radius_spinbox.value(),
+                            self.collapse_maze_radius_spinbox.value(),
                         )
-                        ndim = skel.ndim
-                        struct = np.ones((3,) * ndim, dtype=int)
-                        struct[tuple(1 for _ in range(ndim))] = 0
-                        branch_only = skel & ~junction_mask
-
-                        branch_labels, n_frags = ndi_label(
-                            branch_only, structure=struct
-                        )
-                        if n_frags > 0:
-                            frag_ids = np.arange(1, n_frags + 1)
-                            frag_body = ndi_maximum(
-                                labels_i, labels=branch_labels,
-                                index=frag_ids,
-                            )
-                            frag_len = ndi_sum(
-                                branch_only, labels=branch_labels,
-                                index=frag_ids,
-                            )
-                            frag_body = np.atleast_1d(frag_body).astype(int)
-                            frag_len = np.atleast_1d(frag_len)
-                            valid = (frag_body >= 1) & (
-                                frag_body <= n_bodies_i
-                            )
-                            np.add.at(
-                                branch_counts, frag_body[valid], 1.0
-                            )
-                            np.add.at(
-                                branch_len_totals,
-                                frag_body[valid],
-                                frag_len[valid],
-                            )
-
-                        if np.any(junction_mask):
-                            # A single true branch point often flags
-                            # several adjacent pixels as >=3-neighbor
-                            # (e.g. every pixel immediately touching a
-                            # 4-way junction typically also touches its
-                            # neighboring arm pixels diagonally).
-                            # Connected-component label the junction
-                            # mask itself (full/diagonal connectivity)
-                            # and count *clusters*, not raw pixels, so
-                            # one real branch point isn't counted 2-3
-                            # times.
-                            junction_clusters, n_junc = ndi_label(
-                                junction_mask, structure=struct
-                            )
-                            if n_junc > 0:
-                                junc_ids = np.arange(1, n_junc + 1)
-                                junc_body = ndi_maximum(
-                                    labels_i, labels=junction_clusters,
-                                    index=junc_ids,
-                                )
-                                junc_body = np.atleast_1d(
-                                    junc_body
-                                ).astype(int)
-                                jvalid = (junc_body >= 1) & (
-                                    junc_body <= n_bodies_i
-                                )
-                                np.add.at(
-                                    junction_counts,
-                                    junc_body[jvalid],
-                                    1.0,
-                                )
-
-                        areas_full = np.bincount(
-                            labels_i.ravel(), minlength=n_bodies_i + 1
-                        )
-                        body_areas[: len(areas_full)] = areas_full
+                        branch_counts = result["branch_counts"]
+                        junction_counts = result["junction_counts"]
+                        branch_len_totals = result["branch_len_totals"]
+                        body_areas = result["body_areas"]
                     except Exception as e:
                         print(
                             f"Warning: Morphology Network computation "
@@ -3162,6 +4932,26 @@ class OrganelleContactWidget(QWidget):
                 with np.errstate(divide="ignore", invalid="ignore"):
                     mean_branch_len_per_body = np.where(
                         b_counts > 0, b_len_totals / b_counts, 0.0
+                    )
+
+                for bid in range(1, n_bodies_i + 1):
+                    idx0 = bid - 1
+                    entry = per_body_map.get((i, bid))
+                    if entry is None:
+                        # Morphology Shape wasn't enabled for this run,
+                        # so this body has no entry yet -- seed it with
+                        # the same raw pixel/voxel Area convention used
+                        # in the Shape block above.
+                        entry = {
+                            "Channel": ch_labels[i],
+                            "Body ID": bid,
+                            "Area": float(b_areas[idx0]),
+                        }
+                        per_body_map[(i, bid)] = entry
+                    entry["Branch Count"] = float(b_counts[idx0])
+                    entry["Junction Count"] = float(j_counts[idx0])
+                    entry["Branch Length"] = float(
+                        mean_branch_len_per_body[idx0]
                     )
 
                 bc_mean, _, bc_wmean = self._mean_sd_wmean(
@@ -3338,6 +5128,8 @@ class OrganelleContactWidget(QWidget):
                 out[key] = safe_mean_intensity(
                     raw_signals[source], region_mask
                 )
+
+        self._last_bundle_per_body_rows = list(per_body_map.values())
 
         return out
 
@@ -3545,6 +5337,18 @@ class OrganelleContactWidget(QWidget):
             return [self.last_metrics]
         return []
 
+    def _collect_per_body_export_rows(self) -> List[Dict[str, Any]]:
+        """Mirrors _collect_export_rows: prefer everything accumulated
+        via "Add Analysis" clicks (self.per_body_records, tagged with
+        Analysis Name), falling back to just the most recent Analyze
+        run (self.last_per_body_rows, untagged) if nothing's been
+        added yet."""
+        if self.per_body_records:
+            return self.per_body_records
+        if self.last_per_body_rows:
+            return self.last_per_body_rows
+        return []
+
     def save_metrics(self):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -3579,6 +5383,73 @@ class OrganelleContactWidget(QWidget):
             print(f"Metrics saved to {file_path}")
         except Exception as e:
             print(f"Error saving metrics: {e}")
+
+    def export_per_body_data(self):
+        """Export one row per surviving body per channel (Aspect
+        Ratio, Form Factor, Branch Count, Junction Count, Branch
+        Length, and pixel/voxel Area), tagged with the same Analysis
+        Name convention as the aggregated metrics export. Requires
+        Morphology Shape and/or Morphology Network to have been
+        enabled in Output Selection for at least one stored analysis
+        -- those are the only metrics computed at per-body
+        granularity; everything else in the plugin is already a
+        channel/ROI-level aggregate with nothing further to break out.
+        Intended as raw material for building your own histograms
+        (Excel, GraphPad, Python, etc.), grouped/filtered by Analysis
+        Name (your existing cell/condition labeling convention) and
+        Channel."""
+        rows = self._collect_per_body_export_rows()
+        if not rows:
+            QMessageBox.information(
+                self,
+                "Export Per-Body Data",
+                "No per-body data available yet.\n\n"
+                "Enable Morphology Shape and/or Morphology Network in "
+                "Output Selection, run Analyze, then Add Analysis (or "
+                "just Analyze, if you only need the most recent run) "
+                "before exporting.",
+            )
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Per-Body Data",
+            "Per-Body Export.xlsx",
+            "Excel Files (*.xlsx);;CSV Files (*.csv);;All Files (*)",
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith((".xlsx", ".csv")):
+            file_path = file_path + ".xlsx"
+
+        df = pd.DataFrame(rows)
+        preferred_order = [
+            "Analysis Name",
+            "ROI Number",
+            "Channel",
+            "Body ID",
+            "Area",
+            "Aspect Ratio",
+            "Form Factor",
+            "Branch Count",
+            "Junction Count",
+            "Branch Length",
+        ]
+        cols = [c for c in preferred_order if c in df.columns] + [
+            c for c in df.columns if c not in preferred_order
+        ]
+        df = df[cols]
+
+        try:
+            if file_path.lower().endswith(".csv"):
+                df.to_csv(file_path, index=False)
+            else:
+                df.to_excel(file_path, index=False, engine="openpyxl")
+            print(f"Per-body data exported to {file_path}")
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Export Per-Body Data", f"Failed to export:\n{e}"
+            )
 
     def export_graphpad_prism(self):
         file_path, _ = QFileDialog.getSaveFileName(
@@ -3762,23 +5633,52 @@ class OrganelleContactWidget(QWidget):
             print("No analysis to add. Please run an analysis first.")
             return
 
+        per_body_start = len(self.per_body_records)
+
         if isinstance(self.last_metrics, list):
             base_name = self.analysis_name_edit.text().strip() or "Analysis"
             if self.sequential_label_checkbox.isChecked():
+                # Same Analysis Name convention used for the aggregated
+                # metrics ("<base> <roi+1>"), so per-body rows for a
+                # given ROI get tagged to match -- keyed by ROI Number,
+                # which _compute_metrics_bundle/analyze_contacts stamps
+                # onto both self.last_metrics and
+                # self.last_per_body_rows using the same index.
+                names_by_roi: Dict[Any, str] = {}
                 for idx, metrics in enumerate(self.last_metrics):
                     m = copy.deepcopy(metrics)
-                    m["Analysis Name"] = f"{base_name} {idx+1}"
+                    name = f"{base_name} {idx+1}"
+                    m["Analysis Name"] = name
                     self.metrics_list.append(m)
+                    names_by_roi[metrics.get("ROI Number", idx)] = name
+                for row in self.last_per_body_rows:
+                    r = copy.deepcopy(row)
+                    r["Analysis Name"] = names_by_roi.get(
+                        row.get("ROI Number"), base_name
+                    )
+                    self.per_body_records.append(r)
             else:
                 for metrics in self.last_metrics:
                     m = copy.deepcopy(metrics)
                     m["Analysis Name"] = base_name
                     self.metrics_list.append(m)
+                for row in self.last_per_body_rows:
+                    r = copy.deepcopy(row)
+                    r["Analysis Name"] = base_name
+                    self.per_body_records.append(r)
         else:
             name = self.analysis_name_edit.text().strip() or "Analysis"
             m = copy.deepcopy(self.last_metrics)
             m["Analysis Name"] = name
             self.metrics_list.append(m)
+            for row in self.last_per_body_rows:
+                r = copy.deepcopy(row)
+                r["Analysis Name"] = name
+                self.per_body_records.append(r)
+
+        self._last_added_per_body_count = (
+            len(self.per_body_records) - per_body_start
+        )
 
         self.analysis_count_label.setText(
             f"Analyses Stored: {len(self.metrics_list)}"
@@ -3788,6 +5688,12 @@ class OrganelleContactWidget(QWidget):
     def clear_last_analysis(self):
         if self.metrics_list:
             self.metrics_list.pop()
+            if self._last_added_per_body_count > 0:
+                del self.per_body_records[
+                    len(self.per_body_records)
+                    - self._last_added_per_body_count :
+                ]
+            self._last_added_per_body_count = 0
             self.analysis_count_label.setText(
                 f"Analyses Stored: {len(self.metrics_list)}"
             )
@@ -3800,6 +5706,8 @@ class OrganelleContactWidget(QWidget):
 
     def clear_all_analyses(self):
         self.metrics_list = []
+        self.per_body_records = []
+        self._last_added_per_body_count = 0
         self.analysis_count_label.setText("Analyses Stored: 0")
         print("All analyses cleared.")
 
@@ -3921,13 +5829,41 @@ class OrganelleContactWidget(QWidget):
             f"{ch_index + 1}."
         )
 
-    def show_skeleton_channel(self, ch_index: int):
-        """Show the skeleton/junction layers the Morphology Network
-        metrics (Branch Count, Junction Count, Branch Length, %
-        reticular fractions) are computed from: a green skeleton
-        overlay and a blue junction-point layer, matching the color
-        convention used by MiNA/Fiji's Analyze Skeleton so the overlay
-        reads intuitively for anyone used to that tool."""
+    def show_skeleton_channel(
+        self,
+        ch_index: int,
+        show_skeleton: bool = True,
+        show_junctions: bool = True,
+        show_collapsed: bool = False,
+    ):
+        """Show the Morphology Network visualization layers (Branch
+        Count, Junction Count, Branch Length, % reticular fractions are
+        computed from the same underlying skan analysis): a green raw
+        skeleton overlay (every skeleton pixel, unaffected by any
+        Collapse setting), a blue junction-point layer, and a magenta
+        "Skeleton (Collapsed)" overlay -- what the skeleton looks like
+        AFTER Collapse Bridges/Wide Regions/Junction Clusters/Maze
+        Regions are applied, i.e. the same skeleton with every branch
+        absorbed into a merged junction left out, so only surviving
+        branches remain.
+        Green/blue match the color convention used by MiNA/Fiji's
+        Analyze Skeleton so the overlay reads intuitively for anyone
+        used to that tool.
+
+        ``show_skeleton``/``show_junctions``/``show_collapsed``
+        independently gate which of the three layers actually gets
+        created/updated -- the three manual "Skeleton Ch N" /
+        "Junction Ch N" / "Collapse Ch N" buttons each request a
+        different combination (Collapse requests both show_collapsed
+        and show_junctions, since a simplified network reads best with
+        its merged-junction markers alongside it); the Auto-Display
+        Setup dialog (DisplayLayersDialog) can request any combination.
+        The underlying skan analysis always runs regardless of which
+        flags are set (junction coordinates and the collapsed-pixel
+        mask need the same skeleton either way), only the three napari
+        layer calls at the end are skipped when not requested."""
+        if not show_skeleton and not show_junctions and not show_collapsed:
+            return
         if not hasattr(self, "last_masks") or not self.last_masks:
             print(
                 "No thresholded data available. Please run an analysis first."
@@ -3938,15 +5874,55 @@ class OrganelleContactWidget(QWidget):
             print(f"Channel {ch_index+1} is not active for current analysis.")
             return
 
-        _, n_bodies, _, binary = self._labeled_bodies_for_metrics(
-            self.last_masks[ch_index]
+        # Match the Morphology Network metrics exactly (see the
+        # _fill_small_holes call in _compute_metrics_bundle): fill
+        # small thresholding-noise holes before skeletonizing, so what
+        # you see here is what Branch/Junction Count are computed from.
+        network_mask = self._fill_small_holes(
+            self.last_masks[ch_index], self.max_hole_size_spinbox.value()
+        )
+        labels, n_bodies, _, binary = self._labeled_bodies_for_metrics(
+            network_mask
         )
         if n_bodies == 0:
             print(f"No bodies to skeletonize for channel {ch_index + 1}.")
             return
 
         try:
-            skel, junction_mask = self._skeleton_and_junctions(binary)
+            z_xy_ratio, _, _ = self._get_z_xy_ratio()
+            spacing = (
+                (float(z_xy_ratio), 1.0, 1.0)
+                if binary.ndim == 3
+                else (1.0, 1.0)
+            )
+            # Same skan-based analysis the Morphology Network metrics
+            # use (see _skan_network_analysis) -- so what's displayed
+            # here always matches what Branch/Junction Count are
+            # computed from.
+            result = self._skan_network_analysis(
+                binary,
+                labels,
+                n_bodies,
+                spacing,
+                self.prune_branch_length_spinbox.value(),
+                self.collapse_bridge_length_spinbox.value(),
+                self.max_local_width_spinbox.value(),
+                self.collapse_cluster_radius_spinbox.value(),
+                self.collapse_maze_radius_spinbox.value(),
+            )
+            skel = result["skeleton"]
+            junction_coords = result["junction_coords"]
+            # The skeleton AFTER collapsing: every pixel belonging to a
+            # branch absorbed by ANY of the three collapsing mechanisms
+            # (Collapse Bridges, Collapse Wide Regions, Collapse
+            # Junction Clusters -- see _skan_network_analysis's unified
+            # absorption check) is left out, leaving only the surviving
+            # branches -- exactly the pixels Branch Count/Branch Length
+            # are actually computed from right now. This is a display-
+            # only array computed fresh here; it never modifies ``skel``
+            # itself (the raw Skeleton layer above still shows every
+            # pixel regardless of collapsing).
+            skel_kept = skel & ~result["collapsed_pixel_mask"]
         except Exception as e:
             print(f"Warning: skeletonization failed: {e}")
             return
@@ -3956,6 +5932,11 @@ class OrganelleContactWidget(QWidget):
             f"Skeleton ({ch_label})"
             if self.use_layer_names_checkbox.isChecked()
             else f"Skeleton Ch {ch_index+1}"
+        )
+        skel_collapsed_name = (
+            f"Skeleton (Collapsed) ({ch_label})"
+            if self.use_layer_names_checkbox.isChecked()
+            else f"Skeleton (Collapsed) Ch {ch_index+1}"
         )
         junction_name = (
             f"Junctions ({ch_label})"
@@ -3980,74 +5961,99 @@ class OrganelleContactWidget(QWidget):
             else base_layer.translate
         )
 
-        skel_data = skel.astype(float)
-        if skel_name in self.viewer.layers:
-            lyr = self.viewer.layers[skel_name]
-            lyr.data = skel_data
-            lyr.scale = layer_scale
-            lyr.translate = layer_translate
-        else:
-            self.viewer.add_image(
-                skel_data,
-                name=skel_name,
-                colormap="green",
-                blending="additive",
-                opacity=0.9,
-                scale=layer_scale,
-                translate=layer_translate,
-            )
-
-        # One point per junction *cluster* (its centroid), not per raw
-        # flagged pixel -- a single true branch point often flags
-        # several adjacent pixels, and plotting each separately would
-        # both look noisy and misrepresent the Junction Count metric,
-        # which counts clusters the same way.
-        junction_coords = np.zeros((0, junction_mask.ndim), dtype=float)
-        if np.any(junction_mask):
-            jndim = junction_mask.ndim
-            jstruct = np.ones((3,) * jndim, dtype=int)
-            jstruct[tuple(1 for _ in range(jndim))] = 0
-            junction_clusters, n_junc = ndi_label(
-                junction_mask, structure=jstruct
-            )
-            if n_junc > 0:
-                centroids = ndi_center_of_mass(
-                    junction_mask,
-                    labels=junction_clusters,
-                    index=np.arange(1, n_junc + 1),
-                )
-                junction_coords = np.atleast_2d(np.asarray(centroids))
-
-        if junction_coords.size and layer_scale is not None:
-            scale_arr = np.asarray(layer_scale)
-            if scale_arr.shape[0] == junction_coords.shape[1]:
-                junction_coords_world = junction_coords * scale_arr
-                if layer_translate is not None:
-                    junction_coords_world = (
-                        junction_coords_world + np.asarray(layer_translate)
-                    )
+        if show_skeleton:
+            skel_data = skel.astype(float)
+            if skel_name in self.viewer.layers:
+                lyr = self.viewer.layers[skel_name]
+                lyr.data = skel_data
+                lyr.scale = layer_scale
+                lyr.translate = layer_translate
             else:
-                junction_coords_world = junction_coords
-        else:
-            junction_coords_world = junction_coords
+                self.viewer.add_image(
+                    skel_data,
+                    name=skel_name,
+                    colormap="green",
+                    blending="additive",
+                    opacity=0.9,
+                    scale=layer_scale,
+                    translate=layer_translate,
+                )
 
-        if junction_name in self.viewer.layers:
-            lyr = self.viewer.layers[junction_name]
-            lyr.data = junction_coords_world
-        else:
-            self.viewer.add_points(
-                junction_coords_world,
-                name=junction_name,
-                face_color="blue",
-                size=6,
-                opacity=0.9,
+        # Independent of show_skeleton -- the "Collapse Ch N" button
+        # requests this on its own, without the raw green layer (it
+        # requests show_junctions instead, so the merged-junction
+        # markers accompany the simplified network). ``skel_kept`` is a
+        # SUBSET of ``skel`` (every collapsed/absorbed pixel removed),
+        # so if the raw green Skeleton layer happens to also be visible
+        # at the same time (e.g. via Auto-Display Setup requesting
+        # both), the two additively-blended layers read as: white =
+        # surviving/kept pixels (present in both), plain green =
+        # collapsed/absorbed pixels (present only in the raw layer) --
+        # a quick visual diff of what collapsing removed, for free.
+        if show_collapsed:
+            skel_collapsed_data = skel_kept.astype(float)
+            if skel_collapsed_name in self.viewer.layers:
+                lyr = self.viewer.layers[skel_collapsed_name]
+                lyr.data = skel_collapsed_data
+                lyr.scale = layer_scale
+                lyr.translate = layer_translate
+            else:
+                self.viewer.add_image(
+                    skel_collapsed_data,
+                    name=skel_collapsed_name,
+                    colormap="magenta",
+                    blending="additive",
+                    opacity=0.9,
+                    scale=layer_scale,
+                    translate=layer_translate,
+                )
+
+        # junction_coords already holds one point per true junction
+        # *node* in skan's graph (see _skan_network_analysis) -- no
+        # further pixel-clustering needed here.
+        #
+        # Pass raw pixel-index coordinates and let the Points layer's
+        # own scale/translate do the world-space transform -- the same
+        # way the Skeleton Image layer above is positioned. Previously
+        # this pre-multiplied the coordinates by the image's physical
+        # scale *and* left the Points layer's own scale at its default
+        # of 1, so a world-space position got combined with a
+        # data-space marker size: on a calibrated image (e.g. ~0.1 um
+        # per pixel), a "size=6" marker was rendered as 6 world units
+        # (um) wide -- tens of pixels across -- rather than 6 pixels.
+        #
+        # size=1 makes each marker exactly one pixel/voxel across in
+        # data space -- the same footprint as a single skeleton pixel
+        # in the green layer above -- rather than a blob spanning
+        # several neighboring pixels.
+        if show_junctions:
+            if junction_name in self.viewer.layers:
+                lyr = self.viewer.layers[junction_name]
+                lyr.data = junction_coords
+                lyr.size = 1
+                lyr.scale = layer_scale
+                lyr.translate = layer_translate
+            else:
+                self.viewer.add_points(
+                    junction_coords,
+                    name=junction_name,
+                    face_color="blue",
+                    size=1,
+                    opacity=0.9,
+                    scale=layer_scale,
+                    translate=layer_translate,
+                )
+
+        shown = []
+        if show_skeleton:
+            shown.append(f"skeleton ({int(skel.sum())} px)")
+        if show_collapsed:
+            shown.append(
+                f"post-collapse skeleton ({int(skel_kept.sum())} px)"
             )
-
-        print(
-            f"Displayed skeleton ({int(skel.sum())} px) and "
-            f"{junction_coords.shape[0]} junction(s) for channel "
-            f"{ch_index + 1}."
-        )
+        if show_junctions:
+            shown.append(f"{junction_coords.shape[0]} junction(s)")
+        print(f"Displayed {' and '.join(shown)} for channel {ch_index + 1}.")
 
     # ---------------- ROI layer ----------------
     def toggle_roi_selection(self):

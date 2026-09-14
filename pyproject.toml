@@ -32,6 +32,18 @@ dependencies = [
     "openpyxl",
     "scipy",
     "pandas",
+    # Used by the Morphology Network metrics (Branch/Junction Count,
+    # Branch Length): builds a proper graph from the skeletonized mask
+    # (one node per true junction, correctly separated even when
+    # several true crossings sit close together) instead of the
+    # pixel-proximity clustering heuristic used previously, which could
+    # under-count junctions in dense, tangled networks. summarize()'s
+    # column names changed between 0.12 (hyphen-separated) and 0.13
+    # (underscore-separated by default) -- _widget.py handles both by
+    # checking column presence rather than assuming a version. 0.11 is
+    # a conservative floor; bump if napari hub/CI flags an older
+    # resolved version as missing the API used here.
+    "skan>=0.11",
     "imageio",
     # [base-imageio] adds common formats (PNG, GIF, etc.) via the imageio
     # backend. TIFF/OME-TIFF work out of the box with bare aicsimageio.
