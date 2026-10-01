@@ -58,7 +58,7 @@ dependencies = [
     # AttributeError: '_TIFF' object has no attribute 'RESUNIT'.
     # aicsimageio is now archived/unmaintained, so pin below the
     # breaking release instead of working around it at runtime.
-    "tifffile<2025.2.18",
+    "tifffile<2025.5.11",
     # napari<0.6.1 has a bug where the polygon lasso ROI tool raises
     # TypeError because Shapes._last_cursor_position can be None
     # (napari/napari#7903, fixed by napari/napari#7914 in 0.6.1).
