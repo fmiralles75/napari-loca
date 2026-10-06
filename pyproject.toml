@@ -53,14 +53,9 @@ dependencies = [
     # aicsimageio's [nd2] extra since aicsimageio itself is no longer
     # used to read these files at all.
     "nd2>=0.7.0",
-    # CZI (Zeiss) and LIF (Leica) support are GPL-licensed and deliberately
-    # excluded from aicsimageio's own "all" extra so it doesn't pull GPL
-    # code into non-GPL projects by default; aicsimageio's docs say to add
-    # them directly if you need them. Not legal advice -- if license
-    # compatibility matters for your distribution, worth a second look.
-    "aicspylibczi>=3.1.1",
     "fsspec>=2022.8.0",
-    "readlif>=0.6.4",
+    # CZI (Zeiss) and LIF (Leica) readers are optional extras -- see
+    # [project.optional-dependencies] below.
     # tifffile 2025.2.18 removed the deprecated TIFF.RESUNIT enum that
     # aicsimageio's tiff reader still depends on, causing
     # AttributeError: '_TIFF' object has no attribute 'RESUNIT'.
@@ -74,6 +69,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# CZI (Zeiss) and LIF (Leica) support are GPL-licensed and deliberately
+# excluded from aicsimageio's own "all" extra so it doesn't pull GPL code
+# into non-GPL projects by default; aicsimageio's docs say to add them
+# directly if you need them. Kept as opt-in extras for the same reason,
+# and because aicspylibczi is a compiled package: on GitHub CI with
+# Python 3.12 pip found no usable wheel alongside LocA's other pins and
+# tried (and failed) to build it from source. Without these, ND2/TIFF/OME-TIFF still open;
+# a .czi/.lif file is simply not claimed by this reader.
+#   pip install "napari-organelle-contact-analyzer[czi]"   (Zeiss)
+#   pip install "napari-organelle-contact-analyzer[lif]"   (Leica)
+czi = ["aicspylibczi>=3.1.1"]
+lif = ["readlif>=0.6.4"]
+all-formats = ["aicspylibczi>=3.1.1", "readlif>=0.6.4"]
 testing = [
     "tox",
     "pytest",  # https://docs.pytest.org/en/latest/contents.html
