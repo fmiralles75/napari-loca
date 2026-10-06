@@ -24,13 +24,19 @@ classifiers = [
 ]
 requires-python = ">=3.10"  # napari>=0.6.1 requires Python 3.10+
 dependencies = [
-    "numpy",
+    # numpy<2 and scikit-image<0.24 keep one consistent binary stack.
+    # A fresh install otherwise mixed a scikit-image wheel compiled for
+    # NumPy 2 with NumPy 1.x pulled in by another dependency, and
+    # importing skimage failed ("numpy.dtype size changed ... Expected 96
+    # from C header, got 88"). scikit-image <0.24 is built against
+    # NumPy 1.x. Revisit once every dependency supports NumPy 2.
+    "numpy<2",
     "magicgui",
     "qtpy",
     # >=0.20: regionprops.perimeter_crofton (Form Factor) and the
-    # tested behaviour of 3D skeletonize; the test suite's golden values
-    # were generated on 0.26.
-    "scikit-image>=0.20",
+    # tested behaviour of 3D skeletonize. Golden test values were
+    # generated on 0.26 and verified identical on 0.20.
+    "scikit-image>=0.20,<0.24",
     "openpyxl",
     "scipy",
     "pandas",
