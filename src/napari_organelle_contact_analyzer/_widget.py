@@ -17,57 +17,64 @@ import copy
 import json
 import re
 import warnings
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
-
+import imageio.v2 as imageio
 import napari
-from magicgui import magic_factory
-from magicgui.widgets import Container, create_widget
-from qtpy.QtGui import QIntValidator
-from qtpy.QtCore import Qt, QSettings
-from qtpy.QtWidgets import (
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QWidget,
-    QLabel,
-    QSlider,
-    QLineEdit,
-    QSpinBox,
-    QComboBox,
-    QFileDialog,
-    QDoubleSpinBox,
-    QCheckBox,
-    QScrollArea,
-    QDialog,
-    QDialogButtonBox,
-    QGroupBox,
-    QGridLayout,
-    QMessageBox,
-    QTableWidget,
-    QTableWidgetItem,
-    QHeaderView,
-    QSizePolicy,
-    QTextEdit,
-)
-
-from skimage import filters
-from skimage.util import img_as_float
-from skimage.measure import regionprops
-from skimage.morphology import skeletonize
-from scipy.ndimage import (
-    distance_transform_edt,
-    label as ndi_label,
-    sum as ndi_sum,
-    maximum as ndi_maximum,
-    convolve as ndi_convolve,
-    center_of_mass as ndi_center_of_mass,
-)
-from skimage.draw import polygon
 import numpy as np
 import pandas as pd
-import imageio.v2 as imageio
-from scipy.spatial import ConvexHull
+from qtpy.QtCore import QSettings, Qt
+from qtpy.QtGui import QDoubleValidator
+from qtpy.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSlider,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+from scipy.ndimage import (
+    center_of_mass as ndi_center_of_mass,
+)
+from scipy.ndimage import (
+    convolve as ndi_convolve,
+)
+from scipy.ndimage import (
+    distance_transform_edt,
+)
+from scipy.ndimage import (
+    label as ndi_label,
+)
+from scipy.ndimage import (
+    maximum as ndi_maximum,
+)
+from scipy.ndimage import (
+    sum as ndi_sum,
+)
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import ConvexHull, cKDTree
+from skimage import filters
+from skimage.draw import polygon
+from skimage.measure import regionprops
+from skimage.morphology import skeletonize
 
 if TYPE_CHECKING:
     import napari
@@ -97,79 +104,245 @@ SETTINGS_SCHEMA_VERSION = 1
 # -----------------------------
 # Helpers
 # -----------------------------
-def compute_contact_density(contacts: np.ndarray, union_mask: np.ndarray):
-    """``union_mask`` should be the same union-of-all-channel-masks used
-    for the "Union" core overlap metric -- passed in directly rather than
-    recomputed here, so this and "Union" always agree and there's only
-    one place that mask gets built."""
-    coords = np.column_stack(np.where(contacts))
-    if coords.shape[0] < 2:
-        avg_dist = np.nan
-    else:
-        from scipy.spatial import KDTree
+def compute_contact_sites(
+    contacts: np.ndarray, z_xy_ratio: float = 1.0
+) -> Tuple[int, float, float]:
+    """Describe the contact mask as discrete contact *sites*.
 
-        tree = KDTree(coords)
-        dists, _ = tree.query(coords, k=2)
-        avg_dist = np.mean(dists[:, 1])
-    cell_area = np.sum(union_mask)
-    density_ratio = avg_dist / cell_area if cell_area > 0 else np.nan
-    return avg_dist, cell_area, density_ratio
+    A site is one connected component of ``contacts`` (face
+    connectivity, the same rule used for bodies). Returns
+    (site_count, mean_site_size, nn_distance):
+
+    * ``mean_site_size`` -- mean pixels/voxels per site (NaN if none);
+    * ``nn_distance`` -- mean distance from each site's centroid to the
+      nearest other site's centroid, in XY pixels with Z weighted by
+      ``z_xy_ratio`` (NaN with fewer than two sites).
+
+    Replaces the old "Avg Contact Dist", which measured the distance
+    between neighbouring contact *pixels* and was therefore 1.0 for
+    every contiguous contact, however the contacts were arranged."""
+    labels, n = ndi_label(contacts)
+    if n == 0:
+        return 0, float("nan"), float("nan")
+    ids = np.arange(1, n + 1)
+    sizes = np.bincount(labels.ravel(), minlength=n + 1)[1:]
+    mean_size = float(np.mean(sizes))
+    if n < 2:
+        return int(n), mean_size, float("nan")
+    cents = np.asarray(
+        ndi_center_of_mass(contacts, labels, ids), dtype=float
+    ).reshape(n, contacts.ndim)
+    if contacts.ndim == 3:
+        cents[:, 0] *= float(z_xy_ratio)
+    d, _ = cKDTree(cents).query(cents, k=2)
+    return int(n), mean_size, float(np.mean(d[:, 1]))
+
+
+def body_aspect_ratio(coords: np.ndarray, spacing) -> Optional[float]:
+    """Aspect ratio (major / minor axis of the best-fit ellipse or
+    ellipsoid) of one body from its pixel/voxel coordinates, measured in
+    physical proportions: ``coords`` are scaled by ``spacing`` (per-axis
+    voxel size, or the Z/XY ratio for Z) before fitting. Equals
+    regionprops' axis_major_length / axis_minor_length when spacing is
+    isotropic (both reduce to sqrt(largest / smallest eigenvalue of the
+    coordinate covariance)), but -- unlike regionprops without spacing
+    -- does not read a round body as elongated just because Z is
+    sampled more coarsely than XY. Returns None for bodies with no
+    extent along some axis (a single pixel, a 1-px line, a body
+    confined to one Z plane), where the ratio is undefined."""
+    if coords.shape[0] < 2:
+        return None
+    c = coords.astype(float) * np.asarray(spacing, dtype=float)
+    ev = np.linalg.eigvalsh(np.cov(c.T, bias=True))
+    lo, hi = float(ev[0]), float(ev[-1])
+    if hi <= 0 or lo <= 1e-12 * hi:
+        return None
+    return float(np.sqrt(hi / lo))
+
+
+def skeleton_branch_lengths(
+    branch_labels: np.ndarray, n_branches: int, z_xy_ratio: float = 1.0
+) -> np.ndarray:
+    """Euclidean length of every labelled skeleton branch, in XY pixels
+    with Z steps weighted by ``z_xy_ratio``. Returns an array of length
+    ``n_branches + 1`` (index 0 unused, = 0).
+
+    Length = the path through the branch's pixel centres (1 per face
+    step, sqrt(2) per in-plane diagonal, etc.) plus one pixel for the
+    two half-pixel end caps, so a straight N-pixel line still measures
+    N. The path is the minimum spanning tree of the branch's pixel
+    adjacency graph, which avoids double counting where a thinned
+    skeleton turns a corner (three mutually-adjacent pixels). Unlike a
+    pixel count, this is the same for a branch in any orientation."""
+    out = np.zeros(n_branches + 1, dtype=float)
+    if n_branches == 0:
+        return out
+    from scipy.sparse.csgraph import minimum_spanning_tree
+
+    shape = branch_labels.shape
+    ndim = branch_labels.ndim
+    lin = np.flatnonzero(branch_labels)  # sorted
+    coords = np.column_stack(np.unravel_index(lin, shape))
+    lab = branch_labels.ravel()[lin]
+    spacing = np.ones(ndim)
+    if ndim == 3:
+        spacing[0] = float(z_xy_ratio)
+    # Half of the neighbourhood: each adjacent pair is visited once.
+    offsets = [
+        o
+        for o in (np.argwhere(np.ones((3,) * ndim)) - 1)
+        if tuple(o) > (0,) * ndim
+    ]
+    rows, cols, wts = [], [], []
+    for o in offsets:
+        nb = coords + o
+        ok = np.all((nb >= 0) & (nb < shape), axis=1)
+        if not ok.any():
+            continue
+        src = np.nonzero(ok)[0]
+        nlin = np.ravel_multi_index(tuple(nb[ok].T), shape)
+        pos = np.searchsorted(lin, nlin)
+        pos = np.minimum(pos, lin.size - 1)
+        hit = lin[pos] == nlin
+        rows.append(src[hit])
+        cols.append(pos[hit])
+        wts.append(
+            np.full(int(hit.sum()), float(np.sqrt(np.sum((o * spacing) ** 2))))
+        )
+    if rows:
+        r = np.concatenate(rows)
+        c = np.concatenate(cols)
+        w = np.concatenate(wts)
+        g = coo_matrix((w, (r, c)), shape=(lin.size, lin.size)).tocsr()
+        mst = minimum_spanning_tree(g).tocoo()
+        np.add.at(out, lab[mst.row], mst.data)
+    out[1:] += 1.0
+    return out
 
 
 def compute_roi_geometry(poly_data: np.ndarray):
+    """Feret (caliper) diameters of an ROI polygon, in XY pixels.
+
+    Returns (max_feret, min_feret, feret_ratio):
+
+    * ``max_feret`` -- the longest distance between any two points of
+      the ROI (its largest caliper width);
+    * ``min_feret`` -- the narrowest caliper width: the smallest
+      distance between two parallel lines that enclose the ROI;
+    * ``feret_ratio`` = max / min -- orientation-independent; 1.0 for a
+      circle, a/b for an a:b ellipse. Shapes with corners score higher
+      than their side ratio because the max Feret runs corner to
+      corner: a square is sqrt(2) = 1.41, a 2:1 rectangle sqrt(5) = 2.24.
+
+    These match Fiji/ImageJ's "Feret" and "MinFeret" for polygon ROIs.
+    The min Feret is exact: for a convex polygon (the ROI's convex hull)
+    the narrowest caliper always lies flush with one hull edge, so it is
+    the minimum over hull edges of the farthest hull vertex from that
+    edge's line.
+
+    (Replaces "Max Perp Distance", which measured only from the longest
+    chord to the farthest point on ONE side -- so a circle or square
+    scored a ratio of 2.)"""
     if poly_data.shape[1] > 2:
         points2d = np.column_stack((poly_data[:, 2], poly_data[:, 1]))
     else:
         points2d = poly_data
+    points2d = np.asarray(points2d, dtype=float)
     if points2d.shape[0] < 3:
         return np.nan, np.nan, np.nan
     try:
         hull = ConvexHull(points2d)
-        hull_points = points2d[hull.vertices]
-        max_dist = 0
-        p1 = None
-        p2 = None
-        for i in range(len(hull_points)):
-            for j in range(i + 1, len(hull_points)):
-                d = np.linalg.norm(hull_points[i] - hull_points[j])
-                if d > max_dist:
-                    max_dist = d
-                    p1 = hull_points[i]
-                    p2 = hull_points[j]
-        max_perp = 0
-        if p1 is not None and p2 is not None and np.linalg.norm(p2 - p1) != 0:
-            for point in points2d:
-                d_perp = np.abs(
-                    np.cross(p2 - p1, p1 - point)
-                ) / np.linalg.norm(p2 - p1)
-                if d_perp > max_perp:
-                    max_perp = d_perp
-        dist_ratio = max_dist / max_perp if max_perp > 0 else np.nan
-        return max_dist, max_perp, dist_ratio
-    except Exception:
+    except Exception:  # noqa: BLE001 -- collinear/degenerate polygon
         return np.nan, np.nan, np.nan
+    hp = points2d[hull.vertices]  # counter-clockwise
+    # One hull vertex at a time keeps memory O(n) even for freehand ROIs
+    # with thousands of hull vertices.
+    max_feret = 0.0
+    for p in hp:
+        max_feret = max(max_feret, float(np.max(np.hypot(*(hp - p).T))))
+    min_feret = np.inf
+    for p, q in zip(hp, np.roll(hp, -1, axis=0)):
+        edge = q - p
+        length = float(np.hypot(*edge))
+        if length == 0:
+            continue
+        normal = np.array([-edge[1], edge[0]]) / length
+        # Width of the hull measured perpendicular to this edge.
+        min_feret = min(min_feret, float(np.max(np.abs((hp - p) @ normal))))
+    min_feret = float(min_feret)
+    ratio = max_feret / min_feret if min_feret > 0 else np.nan
+    return max_feret, min_feret, ratio
 
 
-def compute_additional_metrics(
-    max_dist: float, max_perp: float, points2d: np.ndarray
-):
-    if max_dist > 0 and max_perp > 0:
-        ellipse_circ = np.pi * (
-            3 * (max_dist + max_perp)
-            - np.sqrt((3 * max_dist + max_perp) * (max_dist + 3 * max_perp))
-        )
-    else:
-        ellipse_circ = np.nan
-    if points2d.shape[0] < 2:
-        poly_perim = np.nan
-    else:
-        closed = np.vstack((points2d, points2d[0]))
-        diffs = np.diff(closed, axis=0)
-        poly_perim = np.sum(np.linalg.norm(diffs, axis=1))
-    circ_ratio = (
-        ellipse_circ / poly_perim if poly_perim and poly_perim != 0 else np.nan
+def compute_roi_shape_descriptors(
+    points2d: np.ndarray,
+) -> Tuple[float, float, float]:
+    """(circularity, roundness, solidity) of an ROI polygon, computed
+    exactly from its vertices -- the same definitions as Fiji/ImageJ's
+    Shape Descriptors:
+
+    * Circularity = 4*pi*Area / Perimeter^2 -- 1.0 for a circle; lower
+      for elongated AND for irregular outlines (the usual single
+      "roundness" number);
+    * Roundness = 4*Area / (pi * MajorAxis^2) = minor / major axis of
+      the best-fit ellipse (the ellipse with the polygon's area and
+      second moments, as in ImageJ) = 1 / aspect ratio. 1.0 for a
+      circle or a square, 0.5 for a 2:1 ellipse or rectangle; lower
+      only as the shape elongates, barely affected by outline bumps;
+    * Solidity = Area / ConvexHullArea -- 1.0 when the outline has no
+      indentations; lower for lobed or concave shapes.
+
+    Area is the polygon's own (shoelace) area, not a pixel count, so
+    there is no pixelation bias. NaN for degenerate polygons."""
+    pts = np.asarray(points2d, dtype=float)
+    nan3 = (float("nan"),) * 3
+    if pts.shape[0] < 3:
+        return nan3
+    # Centre first: the moment formulas below subtract large, nearly
+    # equal terms when the ROI sits far from the image origin.
+    x = pts[:, 0] - pts[:, 0].mean()
+    y = pts[:, 1] - pts[:, 1].mean()
+    x1, y1 = np.roll(x, -1), np.roll(y, -1)
+    cross = x * y1 - x1 * y
+    signed_area = 0.5 * cross.sum()
+    area = abs(signed_area)
+    perim = polygon_perimeter(pts)
+    try:
+        hull_area = float(ConvexHull(pts).volume)  # 2D "volume" = area
+    except Exception:  # noqa: BLE001 -- collinear/degenerate polygon
+        return nan3
+    if area <= 0 or perim <= 0 or hull_area <= 0:
+        return nan3
+    circularity = 4 * np.pi * area / perim**2
+    # Exact second moments of the polygon (Green's theorem); dividing by
+    # the signed area makes the vertex direction irrelevant.
+    cx = ((x + x1) * cross).sum() / (6 * signed_area)
+    cy = ((y + y1) * cross).sum() / (6 * signed_area)
+    sxx = ((x * x + x * x1 + x1 * x1) * cross).sum() / (12 * signed_area)
+    syy = ((y * y + y * y1 + y1 * y1) * cross).sum() / (12 * signed_area)
+    sxy = ((x * y1 + 2 * x * y + 2 * x1 * y1 + x1 * y) * cross).sum() / (
+        24 * signed_area
     )
-    return ellipse_circ, poly_perim, circ_ratio
+    cov = np.array(
+        [[sxx - cx * cx, sxy - cx * cy], [sxy - cx * cy, syy - cy * cy]]
+    )
+    ev = np.linalg.eigvalsh(cov)
+    roundness = (
+        float(np.sqrt(max(ev[0], 0.0) / ev[1])) if ev[1] > 0 else float("nan")
+    )
+    solidity = area / hull_area
+    return float(circularity), float(roundness), float(solidity)
+
+
+def polygon_perimeter(points2d: np.ndarray) -> float:
+    """Perimeter of a closed polygon (last vertex joins the first);
+    NaN with fewer than two vertices."""
+    pts = np.asarray(points2d, dtype=float)
+    if pts.shape[0] < 2:
+        return float("nan")
+    return float(
+        np.sum(np.linalg.norm(np.roll(pts, -1, axis=0) - pts, axis=1))
+    )
 
 
 def safe_mean_intensity(signal: np.ndarray, region_mask: np.ndarray) -> float:
@@ -203,10 +376,200 @@ def channels_to_text(channels_0_based: List[int]) -> str:
     return ",".join(str(c + 1) for c in chans)
 
 
+# -----------------------------
+# Core analysis steps
+# -----------------------------
+# These are the numerical steps of an analysis run, kept as plain
+# functions (no Qt, no viewer) so the exact code the widget runs can be
+# unit-tested against known answers. OrganelleContactWidget calls them;
+# do not re-implement any of this inline in the widget.
+NORMALIZE_TAIL_FRACTION = 1e-4  # 0.01% of voxels ignored at each end
+
+
+def normalize_signal(
+    sig: np.ndarray, rng: Optional[Tuple[float, float]] = None
+) -> np.ndarray:
+    """Robust-normalize one channel to 0-1, as done before every
+    threshold.
+
+    The 0 and 1 reference points are the intensities with 0.01% of the
+    voxels below / above them (computed over the whole array passed in
+    -- for the widget, the Z-cropped volume), and values outside are
+    clipped to 0-1. Plain min-max scaling made a manual threshold
+    relative to the single brightest voxel, so one hot pixel, cosmic
+    ray or small saturated spot rescaled the whole image and changed
+    the mask everywhere; likewise one dead (zero) pixel moved the
+    bottom of the range. Ignoring the extreme 0.01% removes that
+    without touching real signal (on a 17 x 2048 x 2048 stack that is
+    ~7,000 voxels at each end). Arrays under 10,000 values fall back to
+    exact min-max. Already-0-1 data (max <= 1) and constant images are
+    returned unchanged (as float).
+
+    ``rng`` is the (lo, hi) pair from ``normalization_range`` when the
+    caller already has it (avoids recomputing it on large stacks)."""
+    s2 = np.asarray(sig).astype(float, copy=False)
+    if rng is None:
+        rng = normalization_range(s2)
+    if rng is None:
+        return s2
+    lo, hi = rng
+    return np.clip((s2 - lo) / (hi - lo), 0.0, 1.0)
+
+
+def normalization_range(sig: np.ndarray) -> Optional[Tuple[float, float]]:
+    """The raw intensities that ``normalize_signal`` maps to 0 and 1, or
+    None when the data is left unscaled (already 0-1, or constant). A
+    scaled threshold t corresponds to the raw intensity lo + t*(hi-lo)."""
+    s2 = np.asarray(sig).astype(float, copy=False)
+    vmax = np.nanmax(s2)
+    vmin = np.nanmin(s2)
+    if not (vmax > 1.0 and vmax > vmin):
+        return None
+    flat = s2.ravel()
+    if np.isnan(vmax) or np.isnan(flat).any():
+        flat = flat[~np.isnan(flat)]
+    k = int(np.floor(NORMALIZE_TAIL_FRACTION * flat.size))
+    if k > 0:
+        kth = (k, flat.size - 1 - k)
+        part = np.partition(flat, kth)
+        lo, hi = float(part[kth[0]]), float(part[kth[1]])
+        del part
+        if not hi > lo:
+            lo, hi = float(vmin), float(vmax)
+    else:
+        lo, hi = float(vmin), float(vmax)
+    return lo, hi
+
+
+def threshold_mask(
+    sig: np.ndarray, mode: str, method: str, manual_value: float
+) -> Tuple[np.ndarray, float]:
+    """Threshold one normalized channel. ``mode`` is "Automatic" (use
+    ``AUTO_METHODS[method]``, falling back to the mean if that method
+    fails on this image) or anything else for manual (``manual_value``).
+    Strictly greater-than. Returns (mask, threshold_value_used)."""
+    if mode == "Automatic":
+        try:
+            thresh_val = AUTO_METHODS[method](sig)
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"Warning: Auto threshold '{method}' failed: {e}. "
+                "Using mean fallback."
+            )
+            thresh_val = float(np.mean(sig))
+    else:
+        thresh_val = float(manual_value)
+    return sig > thresh_val, float(thresh_val)
+
+
+THRESH_MODE_RAW = "Manual (raw intensity)"
+
+
+def threshold_channel(
+    raw: np.ndarray,
+    norm: np.ndarray,
+    rng: Optional[Tuple[float, float]],
+    mode: str,
+    method: str,
+    manual_value: float,
+    raw_value: float,
+) -> Tuple[np.ndarray, float, float]:
+    """Threshold one channel in any of the three modes, and report the
+    cutoff on BOTH scales so it can be recorded whichever mode was used.
+
+    * "Automatic" / "Manual": threshold the scaled (0-1) signal ``norm``
+      (see normalize_signal) with the method / ``manual_value``.
+    * THRESH_MODE_RAW: keep voxels whose raw intensity is above
+      ``raw_value`` -- the same absolute cutoff in every image.
+
+    ``rng`` is that channel's ``normalization_range`` (None if the data
+    wasn't rescaled). Returns (mask, scaled_cutoff, raw_cutoff). The two
+    cutoffs describe the same mask: raw = lo + scaled * (hi - lo). In raw
+    mode the scaled equivalent can fall outside 0-1 (cutoff below the
+    0.01th or above the 99.99th percentile)."""
+    lo, hi = rng if rng is not None else (0.0, 1.0)
+    if mode == THRESH_MODE_RAW:
+        raw_cut = float(raw_value)
+        mask = np.asarray(raw) > raw_cut
+        scaled_cut = (raw_cut - lo) / (hi - lo)
+        return mask, float(scaled_cut), raw_cut
+    mask, scaled_cut = threshold_mask(norm, mode, method, manual_value)
+    return mask, float(scaled_cut), float(lo + scaled_cut * (hi - lo))
+
+
+def threshold_columns(
+    ch_labels: List[str], thresholds_used: List[Tuple[float, float]]
+) -> Dict[str, float]:
+    """Export columns recording each channel's applied cutoff:
+    "Threshold Scaled (<ch>)" (0-1 scale) and "Threshold Raw (<ch>)"
+    (raw intensity units)."""
+    out: Dict[str, float] = {}
+    for label, (t_scaled, t_raw) in zip(ch_labels, thresholds_used):
+        out[f"Threshold Scaled ({label})"] = float(t_scaled)
+        out[f"Threshold Raw ({label})"] = float(t_raw)
+    return out
+
+
+def contact_distance_map(mask: np.ndarray, z_xy_ratio: float) -> np.ndarray:
+    """Distance (in XY pixels) from every voxel to the nearest voxel of
+    ``mask``; 0 inside the mask. On 3D data the Z axis is weighted by
+    ``z_xy_ratio`` (Z step / XY pixel size)."""
+    sampling = (z_xy_ratio, 1.0, 1.0) if mask.ndim == 3 else None
+    return distance_transform_edt(~mask, sampling=sampling)
+
+
+def compute_contacts(
+    masks: List[np.ndarray], dists: List[np.ndarray], threshold: float
+) -> np.ndarray:
+    """Contact voxels: for each channel i, voxels lying within
+    ``threshold`` of channel i's mask *and* inside every other
+    channel's mask; the union over i. With two channels this is "voxels
+    of one channel within ``threshold`` of the other". ``threshold`` = 0
+    reduces exactly to the intersection."""
+    n = len(masks)
+    contacts = np.zeros_like(masks[0], dtype=bool)
+    for i in range(n):
+        others = None
+        for j in range(n):
+            if j == i:
+                continue
+            if others is None:
+                others = masks[j].copy()
+            else:
+                others &= masks[j]
+        if others is None:
+            others = masks[i].copy()
+        contacts |= (dists[i] <= threshold) & others
+    return contacts
+
+
 # Kept in one place, and in the same grouping as the Output Selection
 # dialog, so this stays easy to keep in sync as metrics are added,
 # renamed, or removed.
 METRIC_GLOSSARY_HTML = """
+<h3>Threshold Scale</h3>
+<p>Each channel is rescaled to 0&ndash;1 before thresholding, so a Manual
+threshold is a fraction of that channel's intensity range in the analyzed
+Z range. The range runs from the intensity with 0.01% of voxels below it
+to the intensity with 0.01% of voxels above it (values outside are
+clipped), rather than from the single dimmest to the single brightest
+voxel &mdash; so one hot pixel, cosmic ray or small saturated spot no
+longer rescales the image and changes the mask.</p>
+<p><b>Manual (raw intensity)</b> mode instead keeps every voxel brighter
+than a fixed raw intensity (detector counts), identically in every image.
+That removes per-image scaling, but any brightness difference not caused
+by biology (laser or detector drift, bleaching, staining or expression
+level) then changes the mask. Use it only when all compared images were
+acquired and labeled identically, and check that background and bright
+structures have similar intensities across conditions.</p>
+<p><b>Threshold Scaled / Threshold Raw (per channel)</b> &mdash; the cutoff
+actually applied in each analysis, on both scales (raw = the scaled value
+converted back to intensity units), whatever mode was used. Also shown
+under each channel's controls as "Last run". Comparing these across
+images shows how much the effective cutoff varied, and gives the values to
+report in methods. Keep the same threshold policy across every condition
+you compare.</p>
+
 <h3>Core Overlap Metrics</h3>
 <p><b>Intersection</b> &mdash; pixel count where all channels are
 simultaneously thresholded-positive (logical AND across channels).</p>
@@ -244,8 +607,8 @@ of those connected components (Signal Area / Body Count).</p>
 per Body divided by Signal Area (equivalent to 1/Body Count). Near 1
 means the channel's signal is essentially one contiguous body; near 0
 means it's spread across many bodies.</p>
-<p><i>Tip:</i> in the Thresholding section, "Bodies Ch N" (or the
-"Auto-show body label layers" checkbox) displays exactly the
+<p><i>Tip:</i> in the Thresholding section, "Bodies Ch N" (or Body Labels in
+Auto-Display Setup, under Metrics &amp; Display Settings) displays exactly the
 connected-component groupings these three metrics are computed from,
 as a color-coded Labels layer &mdash; each body gets its own color.</p>
 <p><i>Minimum Body Size:</i> thresholded masks often leave behind
@@ -272,17 +635,34 @@ size &mdash; "where does most of the signal mass sit"). These can
 meaningfully disagree; that disagreement is informative, not a
 contradiction to resolve.</p>
 <p><b>Aspect Ratio</b> &mdash; major/minor axis length of each body's
-best-fit ellipse. Near 1 is circular; higher is more elongated.</p>
+best-fit ellipse (ellipsoid in 3D). Near 1 is circular; higher is more
+elongated. On Z-stacks the fit uses physical proportions (Z weighted by the
+Z/XY calibration), so a round body isn't read as elongated just because Z
+is sampled more coarsely than XY.</p>
 <p><b>Form Factor</b> &mdash; perimeter&sup2; / (4&pi;&times;area), the
 inverse of circularity. More sensitive to branching/irregular outlines
-than Aspect Ratio alone. Not defined for 3D (Z-stack) bodies, where it
+than Aspect Ratio alone. The perimeter is the Crofton estimate, which
+stays close to the true value for small and large bodies alike (the
+simple pixel-edge perimeter makes small round bodies look rounder than
+large ones). Not defined for 3D (Z-stack) bodies, where it
 reports as blank/NaN; Aspect Ratio still works in 3D.</p>
 <p><b>Branch Count / Junction Count / Branch Length (per body)</b>
 &mdash; from skeletonizing the mask down to a 1-pixel-wide medial axis
 and classifying each skeleton pixel by neighbor count: a junction is a
-skeleton pixel with 3 or more neighbors. Branch Length is a pixel-count
-approximation of each branch's length, not a true Euclidean path
-length.</p>
+skeleton pixel with 3 or more neighbors, and touching junction pixels
+count as one junction. Branch Length is the length of the path through
+the branch's pixel centers (1 per straight step, &radic;2 per diagonal,
+Z steps weighted by the Z/XY calibration) plus one pixel for the end caps,
+in XY pixels &mdash; multiply by the pixel size for &micro;m. It does not
+depend on which way a branch is oriented.</p>
+<p><b>Merge junctions within</b> (Morphology section, off by default)
+&mdash; junctions whose centers lie within this many XY pixels (Z scaled
+by the voxel ratio) are counted as one, and the short skeleton segments
+joining them stop counting as branches. Use it when wide bodies produce
+ladder-like skeletons whose rungs add junctions that are not real branch
+points. Merging chains transitively, so large values can fold a whole
+dense region into one junction: keep the value small (about a body's
+width) and identical across every condition you compare.</p>
 <p><b>% Bodies with Junctions</b> &mdash; fraction of bodies (by count)
 with at least one junction, i.e. showing any branching.</p>
 <p><b>% Signal Area in Junction-Containing Bodies</b> &mdash; fraction
@@ -296,9 +676,9 @@ resulting pieces often each retain a junction point, so a naive
 per-object junction-presence count can rise even as the structure is
 clearly becoming more fragmented. Read these as trend indicators
 alongside Fragmentation Coefficient, not in isolation.</p>
-<p><i>Tip:</i> in the Morphology section, "Skeleton Ch N" (or the
-"Auto-show skeleton layers" checkbox) displays the skeleton (green)
-and junctions (blue) these metrics are computed from &mdash; the same
+<p><i>Tip:</i> in the Morphology section, "Skeleton Ch N" and
+"Junction Ch N" (or Skeleton/Junctions in Auto-Display Setup) display the
+skeleton (green) and junctions (blue) these metrics are computed from &mdash; the same
 color convention used by MiNA/Fiji's Analyze Skeleton.</p>
 <p><i>Performance:</i> both Shape and Network are off by default and
 add real computation time, especially Network on large 3D stacks,
@@ -322,24 +702,37 @@ Off by default; only appears if you've set one up via Output
 Selection.</p>
 
 <h3>Advanced ROI/Spatial Metrics</h3>
-<p><b>Max Distance</b> &mdash; longest pairwise distance between points
-on the ROI's convex hull (its Feret diameter).</p>
-<p><b>Max Perp Distance</b> &mdash; the widest perpendicular spread
-relative to that long axis.</p>
-<p><b>Distance Ratio</b> &mdash; Max Distance / Max Perp Distance, an
-elongation score.</p>
-<p><b>Ellipse Circumference</b> &mdash; the circumference of a
-theoretical ellipse with those two distances as its axes.</p>
+<p>ROI geometry describes the shape of each drawn ROI itself, in XY
+pixels (multiply by the pixel size for &micro;m).</p>
+<p><b>Max Feret</b> &mdash; the ROI's longest caliper width: the
+greatest distance between any two of its points.</p>
+<p><b>Min Feret</b> &mdash; the ROI's narrowest caliper width: the
+smallest gap between two parallel lines that enclose it. Max and Min
+Feret match Fiji/ImageJ's Feret and MinFeret.</p>
 <p><b>Shape Perimeter</b> &mdash; the ROI polygon's actual measured
 perimeter.</p>
-<p><b>Circumference/Perimeter Ratio</b> &mdash; the theoretical ellipse
-circumference over the real perimeter, a rough roundness/complexity
-score.</p>
-<p><b>Avg Contact Dist</b> &mdash; average nearest-neighbor distance
-between contact-region pixels (a spacing/clustering measure).</p>
-<p><b>Avg Contact Dist / Union Signal Area</b> &mdash; Avg Contact Dist
-divided by the union-of-all-channels signal area (the same area
-reported as "Union" above).</p>
+<p><b>Circularity</b> &mdash; 4&pi;&times;Area / Perimeter&sup2;: 1.0 for a
+circle, lower for elongated <i>and</i> for irregular outlines. The
+standard single measure of how round a cell is.</p>
+<p><b>Roundness</b> &mdash; 4&times;Area / (&pi;&times;Major axis&sup2;),
+using the ROI's best-fit ellipse; equals 1 / aspect ratio. 1.0 for a
+circle or square, 0.5 for a 2:1 oval or rectangle; lower only as the cell
+elongates, and barely affected by outline bumpiness.</p>
+<p><b>Solidity</b> &mdash; Area / convex hull area: 1.0 when the outline
+has no indentations, lower for lobed or concave cells. Circularity,
+Roundness and Solidity match Fiji/ImageJ's Shape Descriptors. All are
+computed from the drawn outline, so draw ROIs the same way across
+conditions (jagged hand-drawn edges add perimeter and lower
+Circularity).</p>
+<p><b>Contact Site Count</b> &mdash; number of separate contact sites:
+connected pieces of the Contact Area (face connectivity, the same rule
+used for bodies).</p>
+<p><b>Mean Contact Site Size</b> &mdash; average pixels/voxels per
+contact site (Contact Area / Contact Site Count).</p>
+<p><b>Contact Site NN Distance</b> &mdash; average distance from each
+contact site's center to the nearest other site's center, in XY pixels
+with Z weighted by the Z/XY calibration. Low = contacts clustered;
+high = contacts spread out. Blank with fewer than two sites.</p>
 """
 
 
@@ -523,7 +916,7 @@ class SignalIntensityComparisonsDialog(QDialog):
 
     def _remove_selected(self):
         rows = sorted(
-            set(idx.row() for idx in self.table.selectedIndexes()),
+            {idx.row() for idx in self.table.selectedIndexes()},
             reverse=True,
         )
         for r in rows:
@@ -717,10 +1110,11 @@ class OutputSelectionDialog(QDialog):
         adv_box = QGroupBox("Advanced ROI/Spatial Metrics")
         adv_layout = QVBoxLayout()
         self.cb_roi_geometry = QCheckBox(
-            "ROI geometry metrics (Max Distance, Perp, Ratio, Perimeter, etc.)"
+            "ROI geometry (Feret diameters, Perimeter, Circularity, "
+            "Roundness, Solidity)"
         )
         self.cb_contact_density = QCheckBox(
-            "Contact spatial metrics (Avg Contact Dist, etc.)"
+            "Contact site metrics (Site Count, Size, NN Distance)"
         )
         self.cb_roi_geometry.setChecked(
             self._selection.get("ROI Geometry", True)
@@ -785,6 +1179,132 @@ class OutputSelectionDialog(QDialog):
         return sel, enable_comp, self._comparisons
 
 
+class DisplayLayersDialog(QDialog):
+    """Choose, per channel, which layers are displayed automatically
+    after Analyze runs: Thresholded, Body Labels, Skeleton and
+    Junctions for each channel, plus the combined Contacts layer.
+    Replaces the four all-channels-or-none "Auto-show ..." checkboxes,
+    so a mixed selection like "Thresholded Ch 1 + Ch 2, Skeleton and
+    Junctions Ch 2 only" can be saved as one setting. Skeleton and
+    Junctions are separate rows, mirroring the separate Skeleton /
+    Junction buttons in the Morphology section.
+
+    Ported from the ``wip/morphology-network-controls`` branch, minus
+    its "Collapsed" row (that layer only exists with the collapse
+    knobs, which were not carried over)."""
+
+    ROWS = [
+        ("thresholded", "Thresholded"),
+        ("body_labels", "Body Labels"),
+        ("skeleton", "Skeleton"),
+        ("junctions", "Junctions"),
+    ]
+
+    def __init__(
+        self,
+        parent: QWidget,
+        current_selection: Dict[str, Any],
+        n_channels_max: int,
+        channel_labels: List[str],
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Auto-Display Setup")
+        self.n_channels_max = n_channels_max
+        self.channel_labels = channel_labels[:]
+        sel = current_selection or {}
+
+        layout = QVBoxLayout()
+        info = QLabel(
+            "Choose which layers are shown automatically after "
+            "clicking Analyze. Each cell below is independent -- mix "
+            "and match any combination of channels and layer types."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        grid_box = QGroupBox("Per-Channel Layers")
+        grid = QGridLayout()
+        for col in range(self.n_channels_max):
+            label = (
+                self.channel_labels[col]
+                if col < len(self.channel_labels)
+                else f"Ch {col + 1}"
+            )
+            grid.addWidget(
+                QLabel(f"<b>{label}</b>"),
+                0,
+                col + 1,
+                alignment=Qt.AlignCenter,
+            )
+
+        self.checkboxes: Dict[str, List[QCheckBox]] = {}
+        for row_idx, (key, row_label) in enumerate(self.ROWS, start=1):
+            grid.addWidget(QLabel(row_label), row_idx, 0)
+            saved_row = sel.get(key, [])
+            boxes = []
+            for col in range(self.n_channels_max):
+                cb = QCheckBox()
+                cb.setChecked(
+                    bool(saved_row[col]) if col < len(saved_row) else False
+                )
+                grid.addWidget(cb, row_idx, col + 1, alignment=Qt.AlignCenter)
+                boxes.append(cb)
+            self.checkboxes[key] = boxes
+        grid_box.setLayout(grid)
+        layout.addWidget(grid_box)
+
+        select_btn_layout = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_none_btn = QPushButton("Select None")
+        select_all_btn.clicked.connect(lambda: self._set_all(True))
+        select_none_btn.clicked.connect(lambda: self._set_all(False))
+        select_btn_layout.addWidget(select_all_btn)
+        select_btn_layout.addWidget(select_none_btn)
+        select_btn_layout.addStretch(1)
+        layout.addLayout(select_btn_layout)
+
+        other_box = QGroupBox("Other")
+        other_layout = QVBoxLayout()
+        self.cb_contacts = QCheckBox("Contacts")
+        self.cb_contacts.setToolTip(
+            "The combined Contacts overlap layer (not per-channel)."
+        )
+        self.cb_contacts.setChecked(bool(sel.get("contacts", True)))
+        other_layout.addWidget(self.cb_contacts)
+        other_box.setLayout(other_layout)
+        layout.addWidget(other_box)
+
+        note = QLabel(
+            "Only channels active in the current analysis are actually "
+            "shown; toggles for inactive channels are simply ignored. "
+            "Skeleton/Junctions are computed on demand from the "
+            "thresholded bodies, so they work whether or not Morphology "
+            "Network metrics are enabled in Output Selection."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        layout.addWidget(bb)
+
+        self.setLayout(layout)
+
+    def _set_all(self, checked: bool) -> None:
+        for boxes in self.checkboxes.values():
+            for cb in boxes:
+                cb.setChecked(checked)
+
+    def get_results(self) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            key: [cb.isChecked() for cb in boxes]
+            for key, boxes in self.checkboxes.items()
+        }
+        result["contacts"] = self.cb_contacts.isChecked()
+        return result
+
+
 # -----------------------------
 # Main Widget
 # -----------------------------
@@ -793,7 +1313,7 @@ class OrganelleContactWidget(QWidget):
         super().__init__()
         self.viewer = viewer
 
-        self.threshold = 0
+        self.threshold = 0.0
         self._last_z_source_signature = None
         self.metrics_list: List[Dict[str, Any]] = []
         self.last_metrics: Any = {}
@@ -801,12 +1321,25 @@ class OrganelleContactWidget(QWidget):
         self.current_roi_index = 0
 
         self._last_contacts_display: Optional[np.ndarray] = None
-        self._last_base_layer: Optional["napari.layers.Image"] = None
+        self._last_base_layer: Optional[napari.layers.Image] = None
         self._last_display_z_translate = None
         self._last_display_scale = None
 
         self.max_channels_supported = 4
         self.channel_layer_indices = [0, 1, 2, 3]
+
+        # Which layers auto-display after Analyze, set in the
+        # "Auto-Display Setup" dialog (DisplayLayersDialog): one bool
+        # per channel for each per-channel layer type, plus one flag
+        # for the combined Contacts layer. Defaults match the old
+        # checkboxes: everything off except Contacts.
+        self.display_layers_selection: Dict[str, Any] = {
+            "thresholded": [False] * self.max_channels_supported,
+            "body_labels": [False] * self.max_channels_supported,
+            "skeleton": [False] * self.max_channels_supported,
+            "junctions": [False] * self.max_channels_supported,
+            "contacts": True,
+        }
 
         self.use_layer_names_checkbox = QCheckBox(
             "Use layer names for channel labels"
@@ -843,20 +1376,36 @@ class OrganelleContactWidget(QWidget):
         self.restrict_to_signal_z = False
         self.restrict_signal_z_channels: List[int] = []
 
-        self.ct_label = QLabel(f"Threshold (px): {self.threshold}")
+        # Contact threshold in (decimal) XY pixels. Distances are
+        # measured with Z steps weighted by the Z/XY voxel ratio, so a
+        # voxel directly above/below is <ratio> px away -- e.g. 1.443
+        # px here -- and a decimal threshold can include it without
+        # also reaching 2 px sideways. The slider moves in 0.1 px
+        # steps (its integer value is px x CT_SLIDER_STEPS_PER_PX);
+        # the text box accepts up to two decimals.
+        self.CT_SLIDER_STEPS_PER_PX = 10
+        self.ct_label = QLabel(f"Threshold (px): {self.threshold:g}")
         self.ct_label.setAlignment(Qt.AlignCenter)
         self.ct_label.setToolTip(
-            "Contact threshold, in pixels: the maximum distance between "
-            "two channels' thresholded signal for them to be counted as "
-            "'in contact'."
+            "Contact threshold, in XY pixels (decimals allowed): the "
+            "maximum distance between two channels' thresholded signal "
+            "for them to be counted as 'in contact'. Z steps count as "
+            "the Z/XY ratio shown below, so a voxel directly above or "
+            "below is only included once the threshold reaches that "
+            "ratio."
         )
         self.ct_slider = QSlider(Qt.Horizontal)
         self.ct_slider.setMinimum(0)
-        self.ct_slider.setMaximum(100)
-        self.ct_slider.setValue(self.threshold)
+        self.ct_slider.setMaximum(100 * self.CT_SLIDER_STEPS_PER_PX)
+        self.ct_slider.setValue(
+            int(round(self.threshold * self.CT_SLIDER_STEPS_PER_PX))
+        )
         self.ct_slider.valueChanged.connect(self.slider_changed)
-        self.ct_text = QLineEdit(str(self.threshold))
-        self.ct_text.setValidator(QIntValidator(0, 100))
+        self.ct_text = QLineEdit(f"{self.threshold:g}")
+        ct_validator = QDoubleValidator(0.0, 100.0, 2)
+        ct_validator.setNotation(QDoubleValidator.StandardNotation)
+        self.ct_text.setValidator(ct_validator)
+        self.ct_text.setMaximumWidth(60)
         self.ct_text.editingFinished.connect(self.text_input_changed)
 
         # Z/XY voxel calibration -- corrects the Contact Threshold's
@@ -865,8 +1414,19 @@ class OrganelleContactWidget(QWidget):
         # (very common in Z-stack microscopy). "Threshold (px)" keeps
         # its existing meaning for lateral distance; only the Z axis's
         # relative weight in the 3D distance transform changes.
+        # Multi-line status (ratio / what a Z step equals / threshold in
+        # physical units). Built from short explicit lines with word
+        # wrap OFF: a word-wrapped QLabel inside this scroll-area panel
+        # gets a one-line height from the layout and its extra lines
+        # were being clipped by the rows above and below. The minimum
+        # height is set from the line count every time the text
+        # changes (see _update_voxel_calibration_status_label).
         self.voxel_calibration_status_label = QLabel("")
-        self.voxel_calibration_status_label.setWordWrap(True)
+        self.voxel_calibration_status_label.setWordWrap(False)
+        self.voxel_calibration_status_label.setTextFormat(Qt.PlainText)
+        self.voxel_calibration_status_label.setSizePolicy(
+            QSizePolicy.Preferred, QSizePolicy.Minimum
+        )
         self.manual_voxel_calibration_checkbox = QCheckBox(
             "Manually specify Z/XY calibration"
         )
@@ -974,6 +1534,8 @@ class OrganelleContactWidget(QWidget):
         self.per_channel_mode: List[QComboBox] = []
         self.per_channel_auto: List[QComboBox] = []
         self.per_channel_manual: List[QDoubleSpinBox] = []
+        self.per_channel_raw: List[QDoubleSpinBox] = []
+        self.per_channel_thresh_info: List[QLabel] = []
         self.per_channel_label_widgets: List[QLabel] = []
         # One QWidget per channel (rather than a bare layout) so the whole
         # row -- label, mode combo, auto combo, manual spinbox -- can be
@@ -996,7 +1558,14 @@ class OrganelleContactWidget(QWidget):
             self.per_channel_label_widgets.append(label)
 
             mode_combo = QComboBox()
-            mode_combo.addItems(["Automatic", "Manual"])
+            mode_combo.addItems(["Automatic", "Manual", THRESH_MODE_RAW])
+            mode_combo.setToolTip(
+                "Automatic: a method picks the cutoff per image.\n"
+                "Manual: a fraction (0-1) of each image's intensity range.\n"
+                "Manual (raw intensity): the same absolute intensity in "
+                "every image -- use only when all images were acquired "
+                "and labeled identically."
+            )
             self.per_channel_mode.append(mode_combo)
 
             # Line 1: which channel, and Automatic vs. Manual thresholding.
@@ -1017,8 +1586,17 @@ class OrganelleContactWidget(QWidget):
 
             manual_spin = QDoubleSpinBox()
             manual_spin.setRange(0.0, 1.0)
-            manual_spin.setSingleStep(0.01)
+            # Qt's default is 2 decimals, which snapped the threshold to
+            # 1% steps of the channel's range -- too coarse, since useful
+            # fluorescence thresholds typically sit around 0.03-0.15.
+            manual_spin.setDecimals(4)
+            manual_spin.setSingleStep(0.001)
             manual_spin.setValue(0.5)
+            manual_spin.setToolTip(
+                "Fraction of this channel's intensity range (0.01th to "
+                "99.99th percentile of the analyzed Z range). See "
+                "Metric Descriptions > Threshold Scale."
+            )
             manual_spin.setEnabled(False)
             self.per_channel_manual.append(manual_spin)
             manual_spin.valueChanged.connect(lambda _: self._save_settings())
@@ -1033,6 +1611,37 @@ class OrganelleContactWidget(QWidget):
             line2.addWidget(QLabel("Manual:"))
             line2.addWidget(manual_spin)
             row_outer.addLayout(line2)
+
+            # Line 3: raw-intensity cutoff, and the cutoff the last run
+            # actually applied on both scales.
+            raw_spin = QDoubleSpinBox()
+            raw_spin.setRange(0.0, 1.0e9)
+            raw_spin.setDecimals(2)
+            raw_spin.setSingleStep(1.0)
+            raw_spin.setValue(0.0)
+            raw_spin.setToolTip(
+                "Raw intensity cutoff (camera/detector counts): voxels "
+                "brighter than this are signal, identically in every "
+                "image."
+            )
+            raw_spin.setEnabled(False)
+            self.per_channel_raw.append(raw_spin)
+            raw_spin.valueChanged.connect(lambda _: self._save_settings())
+            line3 = QHBoxLayout()
+            line3.addWidget(QLabel("Raw:"))
+            line3.addWidget(raw_spin)
+            line3.addStretch(1)
+            row_outer.addLayout(line3)
+
+            info = QLabel("Last run: -")
+            info.setWordWrap(True)
+            info.setToolTip(
+                "Cutoff applied to this channel in the last analysis, as a "
+                "scaled (0-1) value and the equivalent raw intensity. Also "
+                "exported as 'Threshold Scaled' / 'Threshold Raw'."
+            )
+            self.per_channel_thresh_info.append(info)
+            row_outer.addWidget(info)
 
             mode_combo.currentIndexChanged.connect(
                 self._sync_thresh_mode_states
@@ -1077,53 +1686,6 @@ class OrganelleContactWidget(QWidget):
         self.prev_roi_button.clicked.connect(self.prev_roi)
         self.next_roi_button.clicked.connect(self.next_roi)
 
-        self.show_thresh_after_checkbox = QCheckBox(
-            "Auto-show thresholded layers"
-        )
-        self.show_thresh_after_checkbox.setToolTip(
-            "Automatically display each channel's thresholded mask as a "
-            "layer after running Analyze."
-        )
-        self.show_thresh_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self.show_thresh_after_checkbox.setChecked(False)
-        self.show_thresh_after_checkbox.stateChanged.connect(
-            lambda _: self._save_settings()
-        )
-
-        self.show_contacts_after_checkbox = QCheckBox(
-            "Auto-show Contacts layer"
-        )
-        self.show_contacts_after_checkbox.setToolTip(
-            "Automatically display the Contacts layer after running "
-            "Analyze."
-        )
-        self.show_contacts_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self.show_contacts_after_checkbox.setChecked(True)
-        self.show_contacts_after_checkbox.stateChanged.connect(
-            lambda _: self._save_settings()
-        )
-
-        self.show_body_labels_after_checkbox = QCheckBox(
-            "Auto-show body label layers"
-        )
-        self.show_body_labels_after_checkbox.setToolTip(
-            "Automatically display, for each channel, a Labels layer "
-            "showing the individual connected-component \"bodies\" used "
-            "by the Body Count / Fragmentation Coefficient metrics, "
-            "after running Analyze."
-        )
-        self.show_body_labels_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self.show_body_labels_after_checkbox.setChecked(False)
-        self.show_body_labels_after_checkbox.stateChanged.connect(
-            lambda _: self._save_settings()
-        )
-
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.clicked.connect(self.analyze_contacts)
 
@@ -1149,6 +1711,16 @@ class OrganelleContactWidget(QWidget):
             self.open_scale_bar_settings
         )
 
+        self.display_layers_button = QPushButton("Auto-Display Setup")
+        self.display_layers_button.setToolTip(
+            "Choose exactly which layers (per channel: Thresholded, "
+            "Body Labels, Skeleton, Junctions; plus Contacts) are shown "
+            "automatically after Analyze runs, in any combination."
+        )
+        self.display_layers_button.clicked.connect(
+            self.open_display_layers_setup
+        )
+
         self.metrics_glossary_button = QPushButton("Metric Descriptions")
         self.metrics_glossary_button.setToolTip(
             "Show a description of every output metric this plugin can "
@@ -1165,7 +1737,9 @@ class OrganelleContactWidget(QWidget):
             "Restrict Z range to signal"
         )
         self.restrict_signal_z_checkbox.setToolTip(
-            "Restrict analyzed Z-stacks to slices with thresholded signal."
+            "Restrict analyzed Z-stacks to the span from the first to the "
+            "last slice with thresholded signal (empty slices in between "
+            "are kept so Z spacing is preserved)."
         )
         self.restrict_signal_z_checkbox.setSizePolicy(
             QSizePolicy.Preferred, QSizePolicy.Fixed
@@ -1203,9 +1777,7 @@ class OrganelleContactWidget(QWidget):
         self.save_metrics_button.clicked.connect(self.save_metrics)
 
         self.append_spreadsheet_button = QPushButton("Append to Excel")
-        self.append_spreadsheet_button.setToolTip(
-            "Append to Excel Format"
-        )
+        self.append_spreadsheet_button.setToolTip("Append to Excel Format")
         self.append_spreadsheet_button.clicked.connect(
             self.append_to_spreadsheet
         )
@@ -1235,7 +1807,7 @@ class OrganelleContactWidget(QWidget):
         for i in range(self.max_channels_supported):
             b = QPushButton(f"Bodies Ch {i+1}")
             b.setToolTip(
-                f"Show the Body Count/Fragmentation \"bodies\" for "
+                f'Show the Body Count/Fragmentation "bodies" for '
                 f"Channel {i+1} as a color-coded Labels layer"
             )
             b.clicked.connect(
@@ -1257,9 +1829,7 @@ class OrganelleContactWidget(QWidget):
             lambda _: self._save_settings()
         )
 
-        self.filter_body_metrics_checkbox = QCheckBox(
-            "Apply to Body analyses"
-        )
+        self.filter_body_metrics_checkbox = QCheckBox("Apply to Body analyses")
         self.filter_body_metrics_checkbox.setToolTip(
             "Exclude bodies smaller than the Minimum Body Size from Body "
             "Count, Average Area per Body, and Fragmentation "
@@ -1287,34 +1857,58 @@ class OrganelleContactWidget(QWidget):
             self._on_filter_threshold_mask_changed
         )
 
+        self.junction_merge_spinbox = QDoubleSpinBox()
+        self.junction_merge_spinbox.setRange(0.0, 50.0)
+        self.junction_merge_spinbox.setSingleStep(0.5)
+        self.junction_merge_spinbox.setDecimals(1)
+        self.junction_merge_spinbox.setValue(0.0)
+        self.junction_merge_spinbox.setSpecialValueText("Off")
+        self.junction_merge_spinbox.setSuffix(" px")
+        self.junction_merge_spinbox.setToolTip(
+            "Merge junction clusters whose centers lie within this "
+            "distance (XY pixels; Z is scaled by the Z/XY voxel ratio) "
+            "into one junction, and stop counting the short skeleton "
+            "segments that only connect junctions inside one merged "
+            "group (e.g. the 'rungs' a medial axis forms inside a wide "
+            "body). Merging is transitive (chains of nearby junctions "
+            "become one), only happens within a body, and applies to "
+            "both the Morphology Network metrics and the Junctions "
+            "layer. Off = the original per-cluster counting. Keep it "
+            "the same across every condition you compare."
+        )
+        self.junction_merge_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        # Separate Skeleton and Junction buttons per channel, so each
+        # layer can be shown on its own.
         self.show_skeleton_btns: List[QPushButton] = []
+        self.show_junction_btns: List[QPushButton] = []
         for i in range(self.max_channels_supported):
             b = QPushButton(f"Skeleton Ch {i+1}")
             b.setToolTip(
-                f"Show the Morphology Network skeleton/junctions for "
-                f"Channel {i+1} (green skeleton, blue junctions)"
+                f"Show the Morphology Network skeleton (green) for "
+                f"Channel {i+1}."
             )
             b.clicked.connect(
-                lambda _, idx=i: self.show_skeleton_channel(idx)
+                lambda _, idx=i: self.show_skeleton_channel(
+                    idx, show_skeleton=True, show_junctions=False
+                )
             )
             self.show_skeleton_btns.append(b)
 
-        self.show_skeleton_after_checkbox = QCheckBox(
-            "Auto-show skeleton layers"
-        )
-        self.show_skeleton_after_checkbox.setToolTip(
-            "Automatically display, for each channel, the skeleton/"
-            "junction layers used by the Morphology Network metrics, "
-            "after running Analyze. Requires 'Morphology Network' to "
-            "be enabled in Output Selection."
-        )
-        self.show_skeleton_after_checkbox.setSizePolicy(
-            QSizePolicy.Preferred, QSizePolicy.Fixed
-        )
-        self.show_skeleton_after_checkbox.setChecked(False)
-        self.show_skeleton_after_checkbox.stateChanged.connect(
-            lambda _: self._save_settings()
-        )
+            jb = QPushButton(f"Junction Ch {i+1}")
+            jb.setToolTip(
+                f"Show the Morphology Network junction points (blue) "
+                f"for Channel {i+1}, after any 'Merge junctions within' "
+                f"merging -- the same junctions Junction Count counts."
+            )
+            jb.clicked.connect(
+                lambda _, idx=i: self.show_skeleton_channel(
+                    idx, show_skeleton=False, show_junctions=True
+                )
+            )
+            self.show_junction_btns.append(jb)
 
         self.show_contacts_button = QPushButton("Show Contacts")
         self.show_contacts_button.clicked.connect(self.show_contacts)
@@ -1406,12 +2000,10 @@ class OrganelleContactWidget(QWidget):
         # --- Thresholding ---
         thresh_group_layout = QVBoxLayout()
         thresh_group_layout.addWidget(self.channel_thresh_container)
-        thresh_group_layout.addWidget(self.show_thresh_after_checkbox)
         thresh_btn_layout = QGridLayout()
         for i, b in enumerate(self.show_thresh_btns):
             thresh_btn_layout.addWidget(b, i // 2, i % 2)
         thresh_group_layout.addLayout(thresh_btn_layout)
-        thresh_group_layout.addWidget(self.show_body_labels_after_checkbox)
         body_btn_layout = QGridLayout()
         for i, b in enumerate(self.show_body_labels_btns):
             body_btn_layout.addWidget(b, i // 2, i % 2)
@@ -1443,10 +2035,14 @@ class OrganelleContactWidget(QWidget):
         )
         morph_note.setWordWrap(True)
         morph_group_layout.addWidget(morph_note)
-        morph_group_layout.addWidget(self.show_skeleton_after_checkbox)
+        junction_merge_layout = QHBoxLayout()
+        junction_merge_layout.addWidget(QLabel("Merge junctions within:"))
+        junction_merge_layout.addWidget(self.junction_merge_spinbox)
+        morph_group_layout.addLayout(junction_merge_layout)
         skel_btn_layout = QGridLayout()
-        for i, b in enumerate(self.show_skeleton_btns):
-            skel_btn_layout.addWidget(b, i // 2, i % 2)
+        for i in range(self.max_channels_supported):
+            skel_btn_layout.addWidget(self.show_skeleton_btns[i], i, 0)
+            skel_btn_layout.addWidget(self.show_junction_btns[i], i, 1)
         morph_group_layout.addLayout(skel_btn_layout)
         layout.addWidget(self._group_box("Morphology", morph_group_layout))
 
@@ -1472,9 +2068,7 @@ class OrganelleContactWidget(QWidget):
         contact_group_layout.addLayout(ct_layout)
 
         contact_group_layout.addWidget(self.voxel_calibration_status_label)
-        contact_group_layout.addWidget(
-            self.manual_voxel_calibration_checkbox
-        )
+        contact_group_layout.addWidget(self.manual_voxel_calibration_checkbox)
         voxel_cal_layout = QHBoxLayout()
         voxel_cal_layout.addWidget(QLabel("Z step:"))
         voxel_cal_layout.addWidget(self.z_step_spinbox)
@@ -1483,7 +2077,6 @@ class OrganelleContactWidget(QWidget):
         contact_group_layout.addLayout(voxel_cal_layout)
 
         contact_group_layout.addWidget(self.analyze_button)
-        contact_group_layout.addWidget(self.show_contacts_after_checkbox)
         contact_group_layout.addWidget(self.show_contacts_button)
         layout.addWidget(
             self._group_box("Contact Analysis", contact_group_layout)
@@ -1496,6 +2089,7 @@ class OrganelleContactWidget(QWidget):
         metrics_grid.addWidget(self.metric_display_selection_button, 0, 1)
         metrics_grid.addWidget(self.scale_bar_settings_button, 1, 0)
         metrics_grid.addWidget(self.metrics_glossary_button, 1, 1)
+        metrics_grid.addWidget(self.display_layers_button, 2, 0)
         metrics_grid.setColumnStretch(2, 1)
         metrics_group_layout.addLayout(metrics_grid)
         metrics_group_layout.addWidget(self.scale_bar_status_label)
@@ -1561,12 +2155,9 @@ class OrganelleContactWidget(QWidget):
     def _sync_thresh_mode_states(self):
         for i in range(self.max_channels_supported):
             mode = self.per_channel_mode[i].currentText()
-            if mode == "Automatic":
-                self.per_channel_auto[i].setEnabled(True)
-                self.per_channel_manual[i].setEnabled(False)
-            else:
-                self.per_channel_auto[i].setEnabled(False)
-                self.per_channel_manual[i].setEnabled(True)
+            self.per_channel_auto[i].setEnabled(mode == "Automatic")
+            self.per_channel_manual[i].setEnabled(mode == "Manual")
+            self.per_channel_raw[i].setEnabled(mode == THRESH_MODE_RAW)
         self._save_settings()
 
     def _sync_active_channel_row_states(self):
@@ -1614,23 +2205,16 @@ class OrganelleContactWidget(QWidget):
             "per_channel_manual": [
                 sp.value() for sp in self.per_channel_manual
             ],
+            "per_channel_raw": [sp.value() for sp in self.per_channel_raw],
             "contact_threshold": self.threshold,
             "auto_adjust_z_range": (
                 self.auto_adjust_z_range_checkbox.isChecked()
             ),
             "restrict_signal_z": self.restrict_signal_z_checkbox.isChecked(),
             "restrict_signal_z_channels": self.restrict_signal_z_channels,
-            "show_thresh_after": self.show_thresh_after_checkbox.isChecked(),
-            "show_body_labels_after": (
-                self.show_body_labels_after_checkbox.isChecked()
-            ),
-            "show_skeleton_after": (
-                self.show_skeleton_after_checkbox.isChecked()
-            ),
-            "show_contacts_after": (
-                self.show_contacts_after_checkbox.isChecked()
-            ),
+            "display_layers_selection": self.display_layers_selection,
             "min_body_size": self.min_body_size_spinbox.value(),
+            "junction_merge_px": self.junction_merge_spinbox.value(),
             "filter_body_metrics": (
                 self.filter_body_metrics_checkbox.isChecked()
             ),
@@ -1703,9 +2287,7 @@ class OrganelleContactWidget(QWidget):
                 )
             )
             self.saved_scale_bar_length = float(
-                data.get(
-                    "saved_scale_bar_length", self.saved_scale_bar_length
-                )
+                data.get("saved_scale_bar_length", self.saved_scale_bar_length)
             )
             self.saved_scale_bar_unit = str(
                 data.get("saved_scale_bar_unit", self.saved_scale_bar_unit)
@@ -1735,8 +2317,10 @@ class OrganelleContactWidget(QWidget):
             )
 
             for i, v in enumerate(data.get("per_channel_mode", [])):
-                if i < len(self.per_channel_mode) and 0 <= int(v) < 2:
-                    self.per_channel_mode[i].setCurrentIndex(int(v))
+                if i < len(self.per_channel_mode):
+                    combo = self.per_channel_mode[i]
+                    if 0 <= int(v) < combo.count():
+                        combo.setCurrentIndex(int(v))
 
             for i, v in enumerate(data.get("per_channel_auto", [])):
                 if i < len(self.per_channel_auto):
@@ -1748,12 +2332,15 @@ class OrganelleContactWidget(QWidget):
                 if i < len(self.per_channel_manual):
                     self.per_channel_manual[i].setValue(float(v))
 
+            for i, v in enumerate(data.get("per_channel_raw", [])):
+                if i < len(self.per_channel_raw):
+                    self.per_channel_raw[i].setValue(float(v))
+
             if "contact_threshold" in data:
-                t = int(np.clip(int(data["contact_threshold"]), 0, 100))
-                self.threshold = t
-                self.ct_slider.setValue(t)
-                self.ct_text.setText(str(t))
-                self.ct_label.setText(f"Threshold (px): {t}")
+                t = float(
+                    np.clip(float(data["contact_threshold"]), 0.0, 100.0)
+                )
+                self._set_contact_threshold(t, save=False)
 
             self.auto_adjust_z_range_checkbox.setChecked(
                 bool(data.get("auto_adjust_z_range", True))
@@ -1761,21 +2348,57 @@ class OrganelleContactWidget(QWidget):
             self.restrict_signal_z_checkbox.setChecked(
                 bool(data.get("restrict_signal_z", False))
             )
-            self.show_thresh_after_checkbox.setChecked(
-                bool(data.get("show_thresh_after", False))
-            )
-            self.show_body_labels_after_checkbox.setChecked(
-                bool(data.get("show_body_labels_after", False))
-            )
-            self.show_skeleton_after_checkbox.setChecked(
-                bool(data.get("show_skeleton_after", False))
-            )
-            self.show_contacts_after_checkbox.setChecked(
-                bool(data.get("show_contacts_after", True))
-            )
+            if isinstance(data.get("display_layers_selection"), dict):
+                saved = data["display_layers_selection"]
+                nmax = self.max_channels_supported
+                for key in (
+                    "thresholded",
+                    "body_labels",
+                    "skeleton",
+                    "junctions",
+                ):
+                    row = saved.get(key, [])
+                    if isinstance(row, list):
+                        padded = [bool(v) for v in row[:nmax]]
+                        padded += [False] * (nmax - len(padded))
+                        self.display_layers_selection[key] = padded
+                self.display_layers_selection["contacts"] = bool(
+                    saved.get("contacts", True)
+                )
+            elif any(
+                k in data
+                for k in (
+                    "show_thresh_after",
+                    "show_body_labels_after",
+                    "show_skeleton_after",
+                    "show_contacts_after",
+                )
+            ):
+                # Migrate the old all-channels "Auto-show ..."
+                # checkboxes: each one that was on becomes "all
+                # channels on" for that layer type.
+                nmax = self.max_channels_supported
+                if bool(data.get("show_thresh_after", False)):
+                    self.display_layers_selection["thresholded"] = [
+                        True
+                    ] * nmax
+                if bool(data.get("show_body_labels_after", False)):
+                    self.display_layers_selection["body_labels"] = [
+                        True
+                    ] * nmax
+                if bool(data.get("show_skeleton_after", False)):
+                    self.display_layers_selection["skeleton"] = [True] * nmax
+                    self.display_layers_selection["junctions"] = [True] * nmax
+                self.display_layers_selection["contacts"] = bool(
+                    data.get("show_contacts_after", True)
+                )
             if "min_body_size" in data:
                 self.min_body_size_spinbox.setValue(
                     int(np.clip(int(data["min_body_size"]), 1, 100000))
+                )
+            if "junction_merge_px" in data:
+                self.junction_merge_spinbox.setValue(
+                    float(np.clip(float(data["junction_merge_px"]), 0.0, 50.0))
                 )
             self.filter_body_metrics_checkbox.setChecked(
                 bool(data.get("filter_body_metrics", True))
@@ -1811,22 +2434,33 @@ class OrganelleContactWidget(QWidget):
         # connected signal.
         self._save_settings()
 
-    def slider_changed(self, value):
+    def _set_contact_threshold(self, value: float, save: bool = True):
+        """Single place that sets the (decimal, px) contact threshold
+        and keeps the label, text box and slider in sync. The slider is
+        updated with its signals blocked so a typed value such as 1.45
+        isn't rounded to the slider's 0.1 px grid by its own echo."""
+        value = round(float(np.clip(value, 0.0, 100.0)), 2)
         self.threshold = value
-        self.ct_label.setText(f"Threshold (px): {self.threshold}")
-        self.ct_text.setText(str(self.threshold))
-        self._save_settings()
+        self.ct_label.setText(f"Threshold (px): {value:g}")
+        self.ct_text.setText(f"{value:g}")
+        self.ct_slider.blockSignals(True)
+        self.ct_slider.setValue(
+            int(round(value * self.CT_SLIDER_STEPS_PER_PX))
+        )
+        self.ct_slider.blockSignals(False)
+        self._update_voxel_calibration_status_label()
+        if save:
+            self._save_settings()
+
+    def slider_changed(self, value):
+        self._set_contact_threshold(value / self.CT_SLIDER_STEPS_PER_PX)
 
     def text_input_changed(self):
         try:
-            value = int(self.ct_text.text())
+            value = float(self.ct_text.text().replace(",", "."))
         except ValueError:
             return
-        value = max(0, min(value, 100))
-        self.threshold = value
-        self.ct_label.setText(f"Threshold (px): {self.threshold}")
-        self.ct_slider.setValue(self.threshold)
-        self._save_settings()
+        self._set_contact_threshold(value)
 
     def _get_image_layers(self) -> List["napari.layers.Image"]:
         return [
@@ -1924,9 +2558,58 @@ class OrganelleContactWidget(QWidget):
         self._update_voxel_calibration_status_label()
         self._save_settings()
 
+    def _get_voxel_sizes(self) -> Optional[Tuple[float, float]]:
+        """(z_step, xy_pixel) in physical units, from the manual
+        calibration or the base layer's scale -- the same sources
+        _get_z_xy_ratio uses -- or None when uncalibrated."""
+        try:
+            if self.manual_voxel_calibration_checkbox.isChecked():
+                z = float(self.z_step_spinbox.value())
+                xy = float(self.xy_pixel_spinbox.value())
+                return (z, xy) if z > 0 and xy > 0 else None
+            base_layer = self._get_mapped_base_layer()
+            if base_layer is None:
+                return None
+            scale = np.asarray(base_layer.scale, dtype=float)
+            if scale.shape[0] < 3:
+                return None
+            z = float(scale[-3])
+            xy = float(np.mean(scale[-2:]))
+            if z <= 0 or xy <= 0 or (z == 1.0 and xy == 1.0):
+                return None
+            return z, xy
+        except Exception:
+            return None
+
     def _update_voxel_calibration_status_label(self):
-        _, _, desc = self._get_z_xy_ratio()
-        self.voxel_calibration_status_label.setText(desc)
+        """Short multi-line calibration readout under the Contact
+        Threshold: the Z/XY ratio and where it came from, what a step
+        in Z equals in threshold pixels, and the current threshold in
+        physical units. The full description stays in the tooltip."""
+        if not hasattr(self, "voxel_calibration_status_label"):
+            return
+        ratio, calibrated, desc = self._get_z_xy_ratio()
+        manual = self.manual_voxel_calibration_checkbox.isChecked()
+        lines = []
+        if calibrated:
+            source = "manual" if manual else "from image"
+            lines.append(f"Z/XY ratio: {ratio:.3f} ({source})")
+            lines.append(f"Voxel directly above/below = {ratio:.3f} px away")
+            sizes = self._get_voxel_sizes()
+            if sizes is not None:
+                z, xy = sizes
+                t = float(getattr(self, "threshold", 0.0))
+                lines.append(
+                    f"XY px {xy:g} \u00b7 Z step {z:g} \u00b7 "
+                    f"threshold \u2248 {t * xy:.3g} \u00b5m"
+                )
+        else:
+            lines.append("Z/XY ratio: 1.000 (no calibration)")
+            lines.append("Z steps treated as 1 px")
+        lbl = self.voxel_calibration_status_label
+        lbl.setText("\n".join(lines))
+        lbl.setToolTip(desc)
+        lbl.setMinimumHeight(lbl.fontMetrics().lineSpacing() * len(lines) + 4)
 
     def _update_z_range_controls(self, force_full_reset: bool = False):
         base_layer = self._get_mapped_base_layer()
@@ -2063,7 +2746,13 @@ class OrganelleContactWidget(QWidget):
             return None
 
         keep_idx = np.where(z_keep)[0]
-        return keep_idx if keep_idx.size > 0 else None
+        if keep_idx.size == 0:
+            return None
+        # Keep the contiguous span from the first to the last plane with
+        # signal, including any empty planes in between. Dropping those
+        # would make planes that were 2+ steps apart adjacent, joining
+        # bodies across the gap and shifting the displayed Z offset.
+        return np.arange(keep_idx[0], keep_idx[-1] + 1)
 
     def _get_display_transform_for_current_analysis(
         self,
@@ -2184,12 +2873,13 @@ class OrganelleContactWidget(QWidget):
             self.z_min_spinbox.setValue(0)
             self.z_max_spinbox.setValue(0)
 
-        norm = []
-        for s in raw:
-            s2 = s.astype(float, copy=False)
-            if np.nanmax(s2) > 1.0 and np.nanmax(s2) > np.nanmin(s2):
-                s2 = (s2 - np.nanmin(s2)) / (np.nanmax(s2) - np.nanmin(s2))
-            norm.append(s2)
+        # Keep each channel's scaling range so thresholds can be reported
+        # in raw intensity too (see threshold_channel).
+        self._last_norm_ranges = [normalization_range(s) for s in raw]
+        norm = [
+            normalize_signal(s, rng)
+            for s, rng in zip(raw, self._last_norm_ranges)
+        ]
 
         return raw, norm, base_layer
 
@@ -2200,6 +2890,18 @@ class OrganelleContactWidget(QWidget):
         name = name.strip()
         if not name:
             name = "Sheet"
+        if len(name) <= 31:
+            return name
+        # Excel caps sheet names at 31 characters. Per-channel metrics
+        # end in "(<channel>)", which plain truncation cut off -- e.g.
+        # "Fragmentation Coefficient (Channel 1)" and "(Channel 2)" both
+        # became "Fragmentation Coefficient (Chan". Keep the
+        # parenthesised suffix and shorten the part before it instead.
+        m = re.match(r"^(.*\S)\s*(\([^()]*\))$", name)
+        if m and len(m.group(2)) <= 20:
+            prefix, suffix = m.group(1), m.group(2)
+            budget = 31 - len(suffix) - 1  # 1 for the "~" marker
+            return prefix[:budget].rstrip() + "~" + suffix
         return name[:31]
 
     def _make_unique_sheet_name(self, base_name: str, used_names: set) -> str:
@@ -2237,8 +2939,23 @@ class OrganelleContactWidget(QWidget):
         if not metric_cols:
             raise ValueError("No numeric metric columns were found to export.")
 
-        used_sheet_names = set()
+        # Sheet names are capped at 31 characters, so a sheet's name
+        # alone can't always carry its full metric name. A "Sheet Index"
+        # sheet (written first) maps every sheet to the exact metric it
+        # holds, so no sheet is ever ambiguous.
+        used_sheet_names = {"Sheet Index", "All_Metrics"}
+        sheet_for_metric = {
+            metric: self._make_unique_sheet_name(metric, used_sheet_names)
+            for metric in metric_cols
+        }
+        index_df = pd.DataFrame(
+            {
+                "Sheet": list(sheet_for_metric.values()),
+                "Metric": list(sheet_for_metric.keys()),
+            }
+        )
         with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
+            index_df.to_excel(writer, sheet_name="Sheet Index", index=False)
             analysis_labels = pd.unique(df_all["Analysis Name"])
 
             for metric in metric_cols:
@@ -2252,20 +2969,24 @@ class OrganelleContactWidget(QWidget):
                     prism_dict[str(label)] = pd.Series(vals)
 
                 df_metric = pd.DataFrame(prism_dict)
-                sheet_name = self._make_unique_sheet_name(
-                    metric, used_sheet_names
+                df_metric.to_excel(
+                    writer, sheet_name=sheet_for_metric[metric], index=False
                 )
-                df_metric.to_excel(writer, sheet_name=sheet_name, index=False)
 
-            df_all.to_excel(
-                writer,
-                sheet_name=self._make_unique_sheet_name(
-                    "All_Metrics", used_sheet_names
-                ),
-                index=False,
-            )
+            df_all.to_excel(writer, sheet_name="All_Metrics", index=False)
 
     # ---------------- Popups ----------------
+    def open_display_layers_setup(self):
+        dlg = DisplayLayersDialog(
+            self,
+            current_selection=self.display_layers_selection,
+            n_channels_max=self.max_channels_supported,
+            channel_labels=self.get_channel_labels(),
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            self.display_layers_selection = dlg.get_results()
+            self._save_settings()
+
     def open_output_selection(self):
         labels = self.get_channel_labels()
         dlg = OutputSelectionDialog(
@@ -2516,22 +3237,19 @@ class OrganelleContactWidget(QWidget):
         # reused for every channel's distance transform below.
         z_xy_ratio, _, _ = self._get_z_xy_ratio(base_layer)
 
+        ranges = getattr(self, "_last_norm_ranges", None) or [None] * n
+        thresholds_used: List[Tuple[float, float]] = []
         for i in range(n):
-            sig = norm_signals[i]
-            mode = self.per_channel_mode[i].currentText()
-            if mode == "Automatic":
-                method = self.per_channel_auto[i].currentText()
-                try:
-                    thresh_val = AUTO_METHODS[method](sig)
-                except Exception as e:
-                    print(
-                        f"Warning: Auto threshold '{method}' failed: {e}. Using mean fallback."
-                    )
-                    thresh_val = float(np.mean(sig))
-            else:
-                thresh_val = float(self.per_channel_manual[i].value())
-
-            m = sig > thresh_val
+            m, t_scaled, t_raw = threshold_channel(
+                raw_signals[i],
+                norm_signals[i],
+                ranges[i] if i < len(ranges) else None,
+                self.per_channel_mode[i].currentText(),
+                self.per_channel_auto[i].currentText(),
+                self.per_channel_manual[i].value(),
+                self.per_channel_raw[i].value(),
+            )
+            thresholds_used.append((t_scaled, t_raw))
             if self.filter_threshold_mask_checkbox.isChecked():
                 # The more aggressive toggle: strip small/noise bodies
                 # out of the mask itself, before anything (Signal Area,
@@ -2541,10 +3259,7 @@ class OrganelleContactWidget(QWidget):
                     m, self.min_body_size_spinbox.value()
                 )
             masks.append(m)
-            sampling = (
-                (z_xy_ratio, 1.0, 1.0) if m.ndim == 3 else None
-            )
-            dists.append(distance_transform_edt(~m, sampling=sampling))
+            dists.append(contact_distance_map(m, z_xy_ratio))
 
         if self.restrict_to_signal_z and masks and masks[0].ndim >= 3:
             selected_channels = self._get_default_restrict_signal_z_channels(n)
@@ -2574,19 +3289,18 @@ class OrganelleContactWidget(QWidget):
 
         self.last_masks = masks
 
-        contacts = np.zeros_like(masks[0], dtype=bool)
-        for i in range(n):
-            others = None
-            for j in range(n):
-                if j == i:
-                    continue
-                if others is None:
-                    others = masks[j].copy()
-                else:
-                    others &= masks[j]
-            if others is None:
-                others = masks[i].copy()
-            contacts |= (dists[i] <= self.threshold) & others
+        contacts = compute_contacts(masks, dists, self.threshold)
+
+        # The cutoff actually applied to each channel, on both scales,
+        # shown next to the threshold controls and exported with every
+        # row -- so it can be compared across images and reported in
+        # methods whichever threshold mode was used.
+        thr_cols = threshold_columns(ch_labels, thresholds_used)
+        for i, (t_scaled, t_raw) in enumerate(thresholds_used):
+            if i < len(self.per_channel_thresh_info):
+                self.per_channel_thresh_info[i].setText(
+                    f"Last run: {t_scaled:.4f} scaled = {t_raw:,.1f} raw"
+                )
 
         roi_layer = None
         for layer in self.viewer.layers:
@@ -2671,6 +3385,7 @@ class OrganelleContactWidget(QWidget):
                     roi_poly_data=poly_data,
                     roi_area=roi_area,
                 )
+                metrics.update(thr_cols)
                 metrics["ROI Number"] = idx
                 per_roi_metrics.append(metrics)
                 union_contacts |= restricted_contacts
@@ -2691,6 +3406,7 @@ class OrganelleContactWidget(QWidget):
                 roi_poly_data=None,
                 roi_area=roi_area_full,
             )
+            self.last_metrics.update(thr_cols)
             self._set_result_text_from_metrics(
                 self.last_metrics, prefix="Full image metrics:\n"
             )
@@ -2698,19 +3414,28 @@ class OrganelleContactWidget(QWidget):
 
         self._last_contacts_display = contacts_display
 
-        if self.show_thresh_after_checkbox.isChecked():
-            for i in range(n):
+        # Which layers to auto-display, per channel and layer type --
+        # set in the "Auto-Display Setup" dialog (DisplayLayersDialog).
+        sel = self.display_layers_selection
+        thresh_sel = sel.get("thresholded", [])
+        body_sel = sel.get("body_labels", [])
+        skel_sel = sel.get("skeleton", [])
+        junc_sel = sel.get("junctions", [])
+        for i in range(n):
+            if i < len(thresh_sel) and thresh_sel[i]:
                 self.show_thresholded_channel(i)
-
-        if self.show_body_labels_after_checkbox.isChecked():
-            for i in range(n):
+        for i in range(n):
+            if i < len(body_sel) and body_sel[i]:
                 self.show_body_labels_channel(i)
+        for i in range(n):
+            show_skel = i < len(skel_sel) and bool(skel_sel[i])
+            show_junc = i < len(junc_sel) and bool(junc_sel[i])
+            if show_skel or show_junc:
+                self.show_skeleton_channel(
+                    i, show_skeleton=show_skel, show_junctions=show_junc
+                )
 
-        if self.show_skeleton_after_checkbox.isChecked():
-            for i in range(n):
-                self.show_skeleton_channel(i)
-
-        if self.show_contacts_after_checkbox.isChecked():
+        if sel.get("contacts", True):
             self._update_contacts_layer(contacts_display, base_layer)
 
     def _region_mask_from_mode(
@@ -2821,17 +3546,169 @@ class OrganelleContactWidget(QWidget):
         by the Morphology Network metrics and the Skeleton layer
         visualization, so what's counted and what's displayed always
         match."""
-        skel = skeletonize(binary_mask)
+        # `> 0` is load-bearing. On skimage versions where 3D
+        # skeletonize returns uint8 0/255 (the old skeletonize_3d
+        # behaviour) rather than bool, leaving it un-coerced breaks
+        # everything below, silently:
+        #   * convolving 255-valued pixels with a 26-neighbour kernel
+        #     overflows uint8 (2*255 = 510 -> 254), so
+        #     `neighbor_count >= 3` is true for essentially every
+        #     skeleton pixel -- a straight line with no junctions has
+        #     all of its pixels flagged as junctions;
+        #   * junction_mask then comes out uint8 0/1 rather than bool,
+        #     so `skel & ~junction_mask` downstream evaluates
+        #     255 & 254 = 254, which is nonzero -- junctions are never
+        #     removed and "branches" become whole connected components;
+        #   * summing that array inflates every branch length 254x.
+        # Verified against real data: fixing this changed Branch Count
+        # from 378 to 3529 and Junction Count from 323 to 1482 on an
+        # unchanged 36,110-pixel skeleton.
+        skel = np.asarray(skeletonize(binary_mask)) > 0
         if not np.any(skel):
             return skel, np.zeros_like(skel, dtype=bool)
         ndim = skel.ndim
         struct = np.ones((3,) * ndim, dtype=int)
         struct[tuple(1 for _ in range(ndim))] = 0
+        # int32 accumulator: a 0/1 skeleton cannot overflow it.
         neighbor_count = ndi_convolve(
-            skel.astype(np.uint8), struct, mode="constant", cval=0
+            skel.astype(np.int32),
+            struct.astype(np.int32),
+            mode="constant",
+            cval=0,
         )
         junction_mask = skel & (neighbor_count >= 3)
         return skel, junction_mask
+
+    @staticmethod
+    def _group_junctions(
+        skel: np.ndarray,
+        junction_mask: np.ndarray,
+        merge_px: float = 0.0,
+        z_ratio: float = 1.0,
+        body_labels: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """Group junction pixels into junctions, optionally merging
+        nearby ones.
+
+        Step 1 (always): touching junction pixels form one cluster
+        (full/diagonal connectivity) -- a single branch point often
+        flags several adjacent pixels.
+
+        Step 2 (only if ``merge_px`` > 0): clusters whose centroids lie
+        within ``merge_px`` of each other are merged into one junction
+        group (single linkage, so chains merge transitively). Distance
+        is in XY pixels with Z multiplied by ``z_ratio``. Clusters in
+        different bodies are never merged. This is the step Nellie
+        performs in ``_clean_junctions``: a medial axis through a body
+        wider than a tubule forms ladders and small loops whose rungs
+        each add two junctions that are not real branch points.
+
+        Branches are the connected pieces of the skeleton left after
+        removing junction pixels. A branch is marked *internal* (and
+        dropped from counts) when it touches at least two clusters, all
+        of them in the same merged group, and is no longer than
+        ``merge_px`` -- i.e. it is a rung inside a merged node.
+
+        Returns a dict: ``n_groups``; ``group_centroids`` (n_groups x
+        ndim, pixel coords, size-weighted); ``group_body`` (body label
+        per group, 0 if ``body_labels`` is None); ``n_clusters``;
+        ``branch_labels`` / ``n_branches`` (all branches, before
+        dropping); ``dropped_branches`` (branch labels to exclude)."""
+        ndim = junction_mask.ndim
+        full = np.ones((3,) * ndim, dtype=int)
+        branch_only = skel & ~junction_mask
+        branch_labels, n_branches = ndi_label(branch_only, structure=full)
+        clusters, n_clusters = ndi_label(junction_mask, structure=full)
+        out: Dict[str, Any] = {
+            "n_groups": 0,
+            "group_centroids": np.zeros((0, ndim), dtype=float),
+            "group_body": np.zeros(0, dtype=int),
+            "n_clusters": int(n_clusters),
+            "branch_labels": branch_labels,
+            "n_branches": int(n_branches),
+            "dropped_branches": np.zeros(0, dtype=int),
+        }
+        if n_clusters == 0:
+            return out
+
+        ids = np.arange(1, n_clusters + 1)
+        centroids = np.atleast_2d(
+            np.asarray(
+                ndi_center_of_mass(junction_mask, clusters, ids), dtype=float
+            )
+        ).reshape(n_clusters, ndim)
+        sizes = np.atleast_1d(ndi_sum(junction_mask, clusters, ids)).astype(
+            float
+        )
+        if body_labels is not None:
+            cbody = np.atleast_1d(
+                ndi_maximum(body_labels, clusters, ids)
+            ).astype(int)
+        else:
+            cbody = np.zeros(n_clusters, dtype=int)
+
+        group = np.arange(n_clusters)
+        if merge_px > 0 and n_clusters > 1:
+            pts = centroids.copy()
+            if ndim == 3:
+                pts[:, 0] *= float(z_ratio)
+            pairs = cKDTree(pts).query_pairs(
+                r=float(merge_px), output_type="ndarray"
+            )
+            if len(pairs):
+                pairs = pairs[cbody[pairs[:, 0]] == cbody[pairs[:, 1]]]
+            if len(pairs):
+                graph = coo_matrix(
+                    (np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                    shape=(n_clusters, n_clusters),
+                )
+                _, group = connected_components(graph, directed=False)
+        _, group = np.unique(group, return_inverse=True)
+        group = group.ravel()
+        n_groups = int(group.max()) + 1
+
+        gsum = np.zeros((n_groups, ndim), dtype=float)
+        np.add.at(gsum, group, centroids * sizes[:, None])
+        gw = np.bincount(group, weights=sizes, minlength=n_groups)
+        gbody = np.zeros(n_groups, dtype=int)
+        gbody[group] = cbody
+        out["n_groups"] = n_groups
+        out["group_centroids"] = gsum / gw[:, None]
+        out["group_body"] = gbody
+
+        if merge_px > 0 and n_groups < n_clusters and n_branches > 0:
+            cluster_group = np.full(n_clusters + 1, -1, dtype=int)
+            cluster_group[1:] = group
+            jc = np.argwhere(junction_mask)
+            jl = clusters[tuple(jc.T)]
+            shape = np.asarray(junction_mask.shape)
+            b_hits, c_hits = [], []
+            for off in np.argwhere(full) - 1:
+                if not off.any():
+                    continue
+                nb = jc + off
+                ok = np.all((nb >= 0) & (nb < shape), axis=1)
+                bl = branch_labels[tuple(nb[ok].T)]
+                hit = bl > 0
+                b_hits.append(bl[hit])
+                c_hits.append(jl[ok][hit])
+            b_hits = np.concatenate(b_hits)
+            c_hits = np.concatenate(c_hits)
+            if b_hits.size:
+                bc = np.unique(np.stack([b_hits, c_hits], axis=1), axis=0)
+                n_cl = np.bincount(bc[:, 0], minlength=n_branches + 1)
+                bg = np.unique(
+                    np.stack([bc[:, 0], cluster_group[bc[:, 1]]], axis=1),
+                    axis=0,
+                )
+                n_gr = np.bincount(bg[:, 0], minlength=n_branches + 1)
+                blen = skeleton_branch_lengths(
+                    branch_labels, n_branches, z_ratio
+                )
+                drop = (n_cl >= 2) & (n_gr == 1) & (blen <= merge_px)
+                drop[0] = False
+                out["dropped_branches"] = np.nonzero(drop)[0]
+        return out
 
     @staticmethod
     def _mean_sd_wmean(
@@ -2944,9 +3821,7 @@ class OrganelleContactWidget(QWidget):
                 out[f"Average Area per Body ({ch_labels[i]})"] = (
                     avg_area_per_body
                 )
-                out[f"Fragmentation Coefficient ({ch_labels[i]})"] = (
-                    frag_coef
-                )
+                out[f"Fragmentation Coefficient ({ch_labels[i]})"] = frag_coef
 
         if self.output_selection.get("Morphology Shape", False):
             # Per-body shape descriptors via skimage.measure.regionprops,
@@ -2973,9 +3848,29 @@ class OrganelleContactWidget(QWidget):
             # Form Factor is reported as NaN rather than a misleading
             # 0.0, while Aspect Ratio (based on the 3D inertia tensor)
             # still works normally.
+            #
+            # Aspect Ratio is fitted in physical proportions (Z scaled
+            # by the Z/XY voxel ratio -- see body_aspect_ratio), so a
+            # round body in a Z-stack doesn't read as elongated.
+            # Form Factor uses the Crofton perimeter estimate: the
+            # default 4-connected perimeter is size-biased (a perfect
+            # disk scores 0.82 at r=3 px and 1.08 at r=25 px), so FF
+            # would shift whenever bodies get smaller, e.g. on
+            # fragmentation. Crofton stays within ~4% of 1 for disks
+            # from r=2 px up.
+            shape_z_ratio = (
+                self._get_z_xy_ratio()[0]
+                if masks and masks[0].ndim == 3
+                else 1.0
+            )
             for i in range(n):
                 labels_i, n_bodies_i, _, _ = self._labeled_bodies_for_metrics(
                     masks[i]
+                )
+                spacing = (
+                    (shape_z_ratio, 1.0, 1.0)
+                    if labels_i.ndim == 3
+                    else (1.0,) * labels_i.ndim
                 )
                 ar_vals: List[float] = []
                 ff_vals: List[float] = []
@@ -2986,26 +3881,18 @@ class OrganelleContactWidget(QWidget):
                         for rp in regionprops(labels_i):
                             area_i = float(rp.area)
                             try:
-                                major = getattr(
-                                    rp, "axis_major_length",
-                                    getattr(rp, "major_axis_length", None),
-                                )
-                                minor = getattr(
-                                    rp, "axis_minor_length",
-                                    getattr(rp, "minor_axis_length", None),
-                                )
-                                if major is not None and minor and minor > 0:
-                                    ar_vals.append(float(major / minor))
+                                ar = body_aspect_ratio(rp.coords, spacing)
+                                if ar is not None:
+                                    ar_vals.append(ar)
                                     ar_areas.append(area_i)
                             except Exception:
                                 pass
                             try:
-                                perim = rp.perimeter
+                                perim = rp.perimeter_crofton
                                 if perim is not None and area_i > 0:
                                     ff_vals.append(
                                         float(
-                                            (perim ** 2)
-                                            / (4 * np.pi * area_i)
+                                            (perim**2) / (4 * np.pi * area_i)
                                         )
                                     )
                                     ff_areas.append(area_i)
@@ -3029,14 +3916,10 @@ class OrganelleContactWidget(QWidget):
 
                 out[f"Aspect Ratio Mean ({ch_labels[i]})"] = ar_mean
                 out[f"Aspect Ratio SD ({ch_labels[i]})"] = ar_sd
-                out[f"Aspect Ratio Weighted Mean ({ch_labels[i]})"] = (
-                    ar_wmean
-                )
+                out[f"Aspect Ratio Weighted Mean ({ch_labels[i]})"] = ar_wmean
                 out[f"Form Factor Mean ({ch_labels[i]})"] = ff_mean
                 out[f"Form Factor SD ({ch_labels[i]})"] = ff_sd
-                out[f"Form Factor Weighted Mean ({ch_labels[i]})"] = (
-                    ff_wmean
-                )
+                out[f"Form Factor Weighted Mean ({ch_labels[i]})"] = ff_wmean
 
         if self.output_selection.get("Morphology Network", False):
             # Skeleton/graph-based network descriptors. The mask is
@@ -3051,9 +3934,10 @@ class OrganelleContactWidget(QWidget):
             #
             # Branches are found by removing junction pixels and
             # relabeling what's left; each surviving fragment is one
-            # branch, and its pixel count stands in for branch length
-            # (a pixel-count proxy, not a true Euclidean skeleton-path
-            # length -- see the Metric Descriptions dialog).
+            # branch. Branch length is the Euclidean path length through
+            # the branch's pixel centres, in XY pixels with Z steps
+            # weighted by the Z/XY voxel ratio (skeleton_branch_lengths)
+            # -- so it no longer depends on how a branch is oriented.
             #
             # As with Morphology Shape, both an unweighted mean (per
             # body) and an area-weighted mean are reported, plus two
@@ -3064,15 +3948,21 @@ class OrganelleContactWidget(QWidget):
             # classification -- see the Metric Descriptions dialog for
             # why a naive per-object junction-presence count can be
             # misleading during fragmentation.
+            junction_merge_px = float(self.junction_merge_spinbox.value())
+            # Used for both junction merging and branch length, so read
+            # it whenever the data is 3D (it is ignored in 2D).
+            junction_z_ratio = (
+                self._get_z_xy_ratio()[0]
+                if masks and masks[0].ndim == 3
+                else 1.0
+            )
             for i in range(n):
                 labels_i, n_bodies_i, _, binary_i = (
                     self._labeled_bodies_for_metrics(masks[i])
                 )
                 branch_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
                 junction_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
-                branch_len_totals = np.zeros(
-                    n_bodies_i + 1, dtype=np.float64
-                )
+                branch_len_totals = np.zeros(n_bodies_i + 1, dtype=np.float64)
                 body_areas = np.zeros(n_bodies_i + 1, dtype=np.float64)
 
                 if n_bodies_i > 0:
@@ -3080,69 +3970,52 @@ class OrganelleContactWidget(QWidget):
                         skel, junction_mask = self._skeleton_and_junctions(
                             binary_i
                         )
-                        ndim = skel.ndim
-                        struct = np.ones((3,) * ndim, dtype=int)
-                        struct[tuple(1 for _ in range(ndim))] = 0
-                        branch_only = skel & ~junction_mask
-
-                        branch_labels, n_frags = ndi_label(
-                            branch_only, structure=struct
+                        # Junction clusters (touching junction pixels =
+                        # one junction), optionally merged by distance
+                        # -- see _group_junctions and the "Merge
+                        # junctions within" control.
+                        jg = self._group_junctions(
+                            skel,
+                            junction_mask,
+                            merge_px=junction_merge_px,
+                            z_ratio=junction_z_ratio,
+                            body_labels=labels_i,
                         )
+                        branch_labels = jg["branch_labels"]
+                        n_frags = jg["n_branches"]
                         if n_frags > 0:
                             frag_ids = np.arange(1, n_frags + 1)
                             frag_body = ndi_maximum(
-                                labels_i, labels=branch_labels,
+                                labels_i,
+                                labels=branch_labels,
                                 index=frag_ids,
                             )
-                            frag_len = ndi_sum(
-                                branch_only, labels=branch_labels,
-                                index=frag_ids,
-                            )
+                            frag_len = skeleton_branch_lengths(
+                                branch_labels, n_frags, junction_z_ratio
+                            )[1:]
                             frag_body = np.atleast_1d(frag_body).astype(int)
-                            frag_len = np.atleast_1d(frag_len)
-                            valid = (frag_body >= 1) & (
-                                frag_body <= n_bodies_i
+                            valid = (
+                                (frag_body >= 1)
+                                & (frag_body <= n_bodies_i)
+                                & ~np.isin(frag_ids, jg["dropped_branches"])
                             )
-                            np.add.at(
-                                branch_counts, frag_body[valid], 1.0
-                            )
+                            np.add.at(branch_counts, frag_body[valid], 1.0)
                             np.add.at(
                                 branch_len_totals,
                                 frag_body[valid],
                                 frag_len[valid],
                             )
 
-                        if np.any(junction_mask):
-                            # A single true branch point often flags
-                            # several adjacent pixels as >=3-neighbor
-                            # (e.g. every pixel immediately touching a
-                            # 4-way junction typically also touches its
-                            # neighboring arm pixels diagonally).
-                            # Connected-component label the junction
-                            # mask itself (full/diagonal connectivity)
-                            # and count *clusters*, not raw pixels, so
-                            # one real branch point isn't counted 2-3
-                            # times.
-                            junction_clusters, n_junc = ndi_label(
-                                junction_mask, structure=struct
+                        if jg["n_groups"] > 0:
+                            junc_body = jg["group_body"]
+                            jvalid = (junc_body >= 1) & (
+                                junc_body <= n_bodies_i
                             )
-                            if n_junc > 0:
-                                junc_ids = np.arange(1, n_junc + 1)
-                                junc_body = ndi_maximum(
-                                    labels_i, labels=junction_clusters,
-                                    index=junc_ids,
-                                )
-                                junc_body = np.atleast_1d(
-                                    junc_body
-                                ).astype(int)
-                                jvalid = (junc_body >= 1) & (
-                                    junc_body <= n_bodies_i
-                                )
-                                np.add.at(
-                                    junction_counts,
-                                    junc_body[jvalid],
-                                    1.0,
-                                )
+                            np.add.at(
+                                junction_counts,
+                                junc_body[jvalid],
+                                1.0,
+                            )
 
                         areas_full = np.bincount(
                             labels_i.ravel(), minlength=n_bodies_i + 1
@@ -3181,25 +4054,19 @@ class OrganelleContactWidget(QWidget):
                 )
                 total_area = float(np.sum(b_areas))
                 pct_area_with_junction = (
-                    float(
-                        np.sum(b_areas[j_counts > 0]) / total_area * 100.0
-                    )
+                    float(np.sum(b_areas[j_counts > 0]) / total_area * 100.0)
                     if total_area > 0
                     else 0.0
                 )
 
                 out[f"Branch Count Mean ({ch_labels[i]})"] = bc_mean
-                out[f"Branch Count Weighted Mean ({ch_labels[i]})"] = (
-                    bc_wmean
-                )
+                out[f"Branch Count Weighted Mean ({ch_labels[i]})"] = bc_wmean
                 out[f"Junction Count Mean ({ch_labels[i]})"] = jc_mean
                 out[f"Junction Count Weighted Mean ({ch_labels[i]})"] = (
                     jc_wmean
                 )
                 out[f"Branch Length Mean ({ch_labels[i]})"] = bl_mean
-                out[f"Branch Length Weighted Mean ({ch_labels[i]})"] = (
-                    bl_wmean
-                )
+                out[f"Branch Length Weighted Mean ({ch_labels[i]})"] = bl_wmean
                 out[f"% Bodies with Junctions ({ch_labels[i]})"] = (
                     pct_bodies_with_junction
                 )
@@ -3248,31 +4115,28 @@ class OrganelleContactWidget(QWidget):
                 rows = roi_poly_data[:, 0]
                 cols = roi_poly_data[:, 1]
             pts2d = np.column_stack((cols, rows))
-            ellipse_circ, poly_perim, circ_ratio = compute_additional_metrics(
-                geom[0], geom[1], pts2d
-            )
-            out["Max Distance"] = float(geom[0])
-            out["Max Perp Distance"] = float(geom[1])
-            out["Distance Ratio"] = float(geom[2])
-            out["Ellipse Circumference"] = float(ellipse_circ)
-            out["Shape Perimeter"] = float(poly_perim)
-            out["Circumference/Perimeter Ratio"] = float(circ_ratio)
+            out["Max Feret"] = float(geom[0])
+            out["Min Feret"] = float(geom[1])
+            out["Shape Perimeter"] = polygon_perimeter(pts2d)
+            circ, rnd, sol = compute_roi_shape_descriptors(pts2d)
+            out["Circularity"] = circ
+            out["Roundness"] = rnd
+            out["Solidity"] = sol
 
         if self.output_selection.get("Contact Spatial", True):
-            # Reuses "union" (already computed above for the "Union"
-            # core overlap metric) instead of a separately-passed-in
-            # union mask -- these used to be computed twice from the
-            # same masks and reported under two different names
-            # ("Union" and "Union Signal Area"); now there's only one
-            # union area, and this ratio's name spells out what it
-            # actually divides.
-            avg_dist, cell_area, density_ratio = compute_contact_density(
-                contacts, union
+            # Contacts as discrete sites (connected components of the
+            # contact mask) -- see compute_contact_sites. Replaces the
+            # old "Avg Contact Dist" (pixel-to-pixel spacing, 1.0 for
+            # any contiguous contact) and its ratio to Union.
+            site_z_ratio = (
+                self._get_z_xy_ratio()[0] if contacts.ndim == 3 else 1.0
             )
-            out["Avg Contact Dist"] = float(avg_dist)
-            out["Avg Contact Dist / Union Signal Area"] = float(
-                density_ratio
+            n_sites, site_size, site_nn = compute_contact_sites(
+                contacts, site_z_ratio
             )
+            out["Contact Site Count"] = int(n_sites)
+            out["Mean Contact Site Size"] = float(site_size)
+            out["Contact Site NN Distance"] = float(site_nn)
 
         if self.enable_intensity_comparisons:
             for comp in self.intensity_comparisons or []:
@@ -3921,13 +4785,25 @@ class OrganelleContactWidget(QWidget):
             f"{ch_index + 1}."
         )
 
-    def show_skeleton_channel(self, ch_index: int):
+    def show_skeleton_channel(
+        self,
+        ch_index: int,
+        show_skeleton: bool = True,
+        show_junctions: bool = True,
+    ):
         """Show the skeleton/junction layers the Morphology Network
         metrics (Branch Count, Junction Count, Branch Length, %
         reticular fractions) are computed from: a green skeleton
         overlay and a blue junction-point layer, matching the color
         convention used by MiNA/Fiji's Analyze Skeleton so the overlay
-        reads intuitively for anyone used to that tool."""
+        reads intuitively for anyone used to that tool.
+
+        ``show_skeleton`` / ``show_junctions`` independently choose
+        which of the two layers is created/updated (the Skeleton Ch N
+        and Junction Ch N buttons each request one; Auto-Display Setup
+        can request either or both). Skeletonization runs either way."""
+        if not show_skeleton and not show_junctions:
+            return
         if not hasattr(self, "last_masks") or not self.last_masks:
             print(
                 "No thresholded data available. Please run an analysis first."
@@ -3938,8 +4814,8 @@ class OrganelleContactWidget(QWidget):
             print(f"Channel {ch_index+1} is not active for current analysis.")
             return
 
-        _, n_bodies, _, binary = self._labeled_bodies_for_metrics(
-            self.last_masks[ch_index]
+        body_labels_disp, n_bodies, _, binary = (
+            self._labeled_bodies_for_metrics(self.last_masks[ch_index])
         )
         if n_bodies == 0:
             print(f"No bodies to skeletonize for channel {ch_index + 1}.")
@@ -3980,74 +4856,78 @@ class OrganelleContactWidget(QWidget):
             else base_layer.translate
         )
 
-        skel_data = skel.astype(float)
-        if skel_name in self.viewer.layers:
-            lyr = self.viewer.layers[skel_name]
-            lyr.data = skel_data
-            lyr.scale = layer_scale
-            lyr.translate = layer_translate
-        else:
-            self.viewer.add_image(
-                skel_data,
-                name=skel_name,
-                colormap="green",
-                blending="additive",
-                opacity=0.9,
-                scale=layer_scale,
-                translate=layer_translate,
-            )
-
-        # One point per junction *cluster* (its centroid), not per raw
-        # flagged pixel -- a single true branch point often flags
-        # several adjacent pixels, and plotting each separately would
-        # both look noisy and misrepresent the Junction Count metric,
-        # which counts clusters the same way.
-        junction_coords = np.zeros((0, junction_mask.ndim), dtype=float)
-        if np.any(junction_mask):
-            jndim = junction_mask.ndim
-            jstruct = np.ones((3,) * jndim, dtype=int)
-            jstruct[tuple(1 for _ in range(jndim))] = 0
-            junction_clusters, n_junc = ndi_label(
-                junction_mask, structure=jstruct
-            )
-            if n_junc > 0:
-                centroids = ndi_center_of_mass(
-                    junction_mask,
-                    labels=junction_clusters,
-                    index=np.arange(1, n_junc + 1),
+        if show_skeleton:
+            skel_data = skel.astype(float)
+            if skel_name in self.viewer.layers:
+                lyr = self.viewer.layers[skel_name]
+                lyr.data = skel_data
+                lyr.scale = layer_scale
+                lyr.translate = layer_translate
+            else:
+                self.viewer.add_image(
+                    skel_data,
+                    name=skel_name,
+                    colormap="green",
+                    blending="additive",
+                    opacity=0.9,
+                    scale=layer_scale,
+                    translate=layer_translate,
                 )
-                junction_coords = np.atleast_2d(np.asarray(centroids))
 
-        if junction_coords.size and layer_scale is not None:
-            scale_arr = np.asarray(layer_scale)
-            if scale_arr.shape[0] == junction_coords.shape[1]:
-                junction_coords_world = junction_coords * scale_arr
-                if layer_translate is not None:
-                    junction_coords_world = (
-                        junction_coords_world + np.asarray(layer_translate)
-                    )
+        junction_count_shown = None
+        if show_junctions:
+            # One point per junction (cluster centroid, or merged-group
+            # centroid when "Merge junctions within" is set), not per raw
+            # flagged pixel -- exactly what the Junction Count metric counts.
+            merge_px = float(self.junction_merge_spinbox.value())
+            jg = self._group_junctions(
+                skel,
+                junction_mask,
+                merge_px=merge_px,
+                z_ratio=self._get_z_xy_ratio()[0] if merge_px > 0 else 1.0,
+                body_labels=body_labels_disp,
+            )
+            junction_coords = jg["group_centroids"]
+            if merge_px > 0:
+                print(
+                    f"Junction merging ({merge_px:g} px): "
+                    f"{jg['n_clusters']} clusters -> {jg['n_groups']} "
+                    f"junctions; {len(jg['dropped_branches'])} internal "
+                    f"branch(es) no longer counted."
+                )
+
+            if junction_coords.size and layer_scale is not None:
+                scale_arr = np.asarray(layer_scale)
+                if scale_arr.shape[0] == junction_coords.shape[1]:
+                    junction_coords_world = junction_coords * scale_arr
+                    if layer_translate is not None:
+                        junction_coords_world = (
+                            junction_coords_world + np.asarray(layer_translate)
+                        )
+                else:
+                    junction_coords_world = junction_coords
             else:
                 junction_coords_world = junction_coords
-        else:
-            junction_coords_world = junction_coords
 
-        if junction_name in self.viewer.layers:
-            lyr = self.viewer.layers[junction_name]
-            lyr.data = junction_coords_world
-        else:
-            self.viewer.add_points(
-                junction_coords_world,
-                name=junction_name,
-                face_color="blue",
-                size=6,
-                opacity=0.9,
-            )
+            if junction_name in self.viewer.layers:
+                lyr = self.viewer.layers[junction_name]
+                lyr.data = junction_coords_world
+            else:
+                self.viewer.add_points(
+                    junction_coords_world,
+                    name=junction_name,
+                    face_color="blue",
+                    size=6,
+                    opacity=0.9,
+                )
+            junction_count_shown = int(junction_coords.shape[0])
 
-        print(
-            f"Displayed skeleton ({int(skel.sum())} px) and "
-            f"{junction_coords.shape[0]} junction(s) for channel "
-            f"{ch_index + 1}."
-        )
+        shown = []
+        if show_skeleton:
+            shown.append(f"skeleton ({int(skel.sum())} px)")
+        if junction_count_shown is not None:
+            shown.append(f"{junction_count_shown} junction(s)")
+        print(f"Displayed {' and '.join(shown)} for channel {ch_index + 1}.")
 
     # ---------------- ROI layer ----------------
     def toggle_roi_selection(self):

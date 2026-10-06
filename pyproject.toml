@@ -28,7 +28,10 @@ dependencies = [
     "numpy",
     "magicgui",
     "qtpy",
-    "scikit-image",
+    # >=0.20: regionprops.perimeter_crofton (Form Factor) and the
+    # tested behaviour of 3D skeletonize; the test suite's golden values
+    # were generated on 0.26.
+    "scikit-image>=0.20",
     "openpyxl",
     "scipy",
     "pandas",
@@ -149,3 +152,12 @@ exclude = [
 
 target-version = "py38"
 fix = true
+
+# The broad `except Exception` blocks in these two files are deliberate:
+# in _widget.py they wrap Qt/napari UI handlers, file I/O and per-body
+# metric steps, where an unexpected error should show a message or skip
+# one body rather than crash napari; in _reader.py a file that can't be
+# opened must return None so napari falls back to another reader.
+[tool.ruff.lint.per-file-ignores]
+"src/napari_organelle_contact_analyzer/_widget.py" = ["BLE001"]
+"src/napari_organelle_contact_analyzer/_reader.py" = ["BLE001"]
