@@ -24,19 +24,19 @@ classifiers = [
 ]
 requires-python = ">=3.10"  # napari>=0.6.1 requires Python 3.10+
 dependencies = [
-    # numpy<2 and scikit-image<0.24 keep one consistent binary stack.
+    # numpy<3 and scikit-image<0.24 keep one consistent binary stack.
     # A fresh install otherwise mixed a scikit-image wheel compiled for
     # NumPy 2 with NumPy 1.x pulled in by another dependency, and
     # importing skimage failed ("numpy.dtype size changed ... Expected 96
     # from C header, got 88"). scikit-image <0.24 is built against
     # NumPy 1.x. Revisit once every dependency supports NumPy 2.
-    "numpy<2",
+    "numpy<3",
     "magicgui",
     "qtpy",
     # >=0.20: regionprops.perimeter_crofton (Form Factor) and the
     # tested behaviour of 3D skeletonize. Golden test values were
     # generated on 0.26 and verified identical on 0.20.
-    "scikit-image>=0.20,<0.24",
+    "scikit-image>=0.20,<0.26",
     "openpyxl",
     "scipy",
     "pandas",
@@ -61,7 +61,7 @@ dependencies = [
     # AttributeError: '_TIFF' object has no attribute 'RESUNIT'.
     # aicsimageio is now archived/unmaintained, so pin below the
     # breaking release instead of working around it at runtime.
-    "tifffile<2025.2.18",
+    "tifffile<2025.5.11",
     # napari<0.6.1 has a bug where the polygon lasso ROI tool raises
     # TypeError because Shapes._last_cursor_position can be None
     # (napari/napari#7903, fixed by napari/napari#7914 in 0.6.1).
