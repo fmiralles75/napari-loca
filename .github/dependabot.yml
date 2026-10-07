@@ -12,3 +12,11 @@ updates:
     python-packages:
       patterns:
         - "*"
+  # These upper bounds are deliberate (see the comments on each pin in
+  # pyproject.toml): raising them reintroduced broken installs on CI
+  # (numpy/scikit-image binary mismatch; tifffile removed an API that
+  # aicsimageio still uses). Loosen them by hand, after testing.
+  ignore:
+    - dependency-name: "numpy"
+    - dependency-name: "scikit-image"
+    - dependency-name: "tifffile"
