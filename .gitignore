@@ -86,3 +86,4 @@ venv/
 # Local experiment scratch (Step 1 preprocessing work) and desktop outputs
 experiments/
 Claude outputs/
+PUBLISHING_ROADMAP.md
