@@ -135,3 +135,165 @@ def test_raw_intensity_mode_in_widget(widget):
             assert raw[k] == pytest.approx(v, abs=1e-4), k
         else:
             assert raw[k] == pytest.approx(v, rel=1e-9), k
+
+
+# ---------------------------------------------------------------------
+# Input controls: mouse wheel needs focus; spinboxes show full values
+# ---------------------------------------------------------------------
+def _send_wheel(w, notches=1):
+    """Deliver one wheel event to ``w`` the way Qt would (unhandled
+    events propagate to the parent, as during real scrolling)."""
+    from qtpy.QtCore import QPoint, QPointF, Qt
+    from qtpy.QtGui import QWheelEvent
+    from qtpy.QtWidgets import QApplication
+
+    pos = QPointF(w.width() / 2, w.height() / 2)
+    glob = QPointF(w.mapToGlobal(pos.toPoint()))
+    ev = QWheelEvent(
+        pos,
+        glob,
+        QPoint(0, 0),
+        QPoint(0, 120 * notches),
+        Qt.NoButton,
+        Qt.NoModifier,
+        Qt.NoScrollPhase,
+        False,
+    )
+    QApplication.sendEvent(w, ev)
+
+
+def test_plain_qt_inputs_are_not_used():
+    """Every spinbox/combo/slider must be a ScrollSafe* subclass, or
+    scrolling the panel changes settings again. Checks the source so
+    dialogs built later are covered too."""
+    import inspect
+    import re
+
+    src = inspect.getsource(W)
+    plain = re.findall(
+        r"(?<![\w.])(QSpinBox|QDoubleSpinBox|QComboBox|QSlider)\(", src
+    )
+    assert plain == []
+
+
+def test_wheel_ignored_until_control_is_focused(widget, monkeypatch):
+    from qtpy.QtCore import Qt
+
+    manual = widget.per_channel_manual[0]  # enabled: fixture sets Manual
+    manual.setValue(0.08)
+    body = widget.min_body_size_spinbox
+    slider = widget.ct_slider
+    combo = widget.channel_mode_combo
+    for w in (manual, body, slider, combo):
+        assert w.focusPolicy() == Qt.StrongFocus  # wheel can't focus it
+        assert not w.hasFocus()
+
+    def state():
+        return (
+            manual.value(),
+            body.value(),
+            slider.value(),
+            combo.currentIndex(),
+        )
+
+    before = state()
+    for w in (manual, body, slider, combo):
+        _send_wheel(w)
+        _send_wheel(w, -2)
+    after = state()
+    assert after == before
+
+    # Once clicked into (focused), the wheel works as normal.
+    for w in (manual, body, slider):
+        monkeypatch.setattr(w, "hasFocus", lambda: True)
+    _send_wheel(manual)
+    assert manual.value() == pytest.approx(0.08 + manual.singleStep())
+    _send_wheel(body)
+    assert body.value() == before[1] + 1
+    _send_wheel(slider)
+    assert slider.value() != before[2]
+
+
+def _hidden_text_px(spin):
+    """How many pixels of the spinbox's text are cut off.
+
+    Paints the inner line edit with the cursor at the end, then at the
+    start: if the text fits, the line edit never scrolls and the two
+    cursor positions are a full text-width apart; if it doesn't fit,
+    they are only the visible width apart.
+    """
+    from qtpy.QtCore import Qt
+
+    le = spin.lineEdit()
+    full = le.fontMetrics().horizontalAdvance(le.text())
+    if le.width() <= 0:  # collapsed: nothing is visible
+        return full
+    le.end(False)
+    le.grab()
+    x_end = le.inputMethodQuery(Qt.ImCursorRectangle).x()
+    le.home(False)
+    le.grab()
+    x_home = le.inputMethodQuery(Qt.ImCursorRectangle).x()
+    return full - (x_end - x_home)
+
+
+def test_spinboxes_show_their_full_value(widget, qtbot):
+    """Under napari's own stylesheet (as when docked), every spinbox in
+    the panel shows its widest value in full even when a layout
+    squeezes it to its minimum width -- in particular all 4 decimals of
+    the manual threshold. Before the fix, napari's ``min-width`` let a
+    crowded row shrink that box to 97 of the 115 px it needs (13 px of
+    "0.0825" hidden), and long values like "10000.0000" lost 21 px even
+    at full size."""
+    from napari.qt import get_stylesheet
+    from qtpy.QtCore import Qt
+    from qtpy.QtWidgets import QAbstractSpinBox, QApplication, QScrollArea
+
+    widget.setStyleSheet(get_stylesheet("dark"))
+    widget.setAttribute(Qt.WA_DontShowOnScreen, True)
+    widget.resize(420, 900)
+    widget.show()
+    qtbot.wait(50)
+
+    spins = widget.findChildren(QAbstractSpinBox)
+    assert widget.per_channel_manual[0] in spins
+    hidden = {}
+    try:
+        for n, spin in enumerate(spins):
+            name = f"#{n} {type(spin).__name__} {spin.toolTip()[:30]!r}"
+            need = W._spinbox_min_width(spin)
+            assert need > 0, name
+            # napari's fixed 90 px minimum replaced by the real need.
+            assert spin.minimumWidth() == need, name
+            old = spin.value()
+            spin.blockSignals(True)
+            spin.setFixedWidth(need)  # the narrowest a layout can make it
+            QApplication.processEvents()
+            for v in (spin.maximum(), spin.minimum()):
+                spin.setValue(v)
+                px = _hidden_text_px(spin)
+                if px > 2:  # sub-pixel rounding between Qt and metrics
+                    hidden[f"{name} {spin.text()!r} @{need}px"] = px
+            spin.setValue(old)
+            spin.setMaximumWidth(16777215)  # QWIDGETSIZE_MAX
+            spin.setMinimumWidth(need)
+            spin.blockSignals(False)
+
+        manual = widget.per_channel_manual[0]
+        manual.setFixedWidth(manual.minimumWidth())
+        manual.setValue(0.0825)
+        QApplication.processEvents()
+        assert manual.text() == "0.0825"
+        manual_hidden = _hidden_text_px(manual)
+
+        # Report how wide a dock LocA needs (run with -s to see it).
+        scroll = widget.findChild(QScrollArea)
+        content = scroll.widget().minimumSizeHint().width()
+        print(
+            f"\nLocA panel content needs >= {content} px "
+            f"(viewport at a 420-px panel: {scroll.viewport().width()})"
+        )
+    finally:
+        widget.hide()
+    assert hidden == {}, f"text cut off (px hidden): {hidden}"
+    assert manual_hidden <= 2

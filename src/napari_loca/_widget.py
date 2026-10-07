@@ -23,7 +23,7 @@ import imageio.v2 as imageio
 import napari
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import QSettings, Qt
+from qtpy.QtCore import QEvent, QRect, QSettings, QSize, Qt
 from qtpy.QtGui import QDoubleValidator
 from qtpy.QtWidgets import (
     QCheckBox,
@@ -44,6 +44,8 @@ from qtpy.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QStyle,
+    QStyleOptionSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -102,6 +104,233 @@ SETTINGS_ORG = "napari-organelle-contact-analyzer"
 SETTINGS_APP = "OrganelleContactWidget"
 SETTINGS_KEY = "widget_state_json"
 SETTINGS_SCHEMA_VERSION = 1
+
+
+# -----------------------------
+# Scroll-safe input widgets
+# -----------------------------
+# LocA's panel sits in a scroll area. By default Qt hands a mouse-wheel
+# event (and keyboard focus) to whichever spinbox, combo box or slider
+# happens to be under the pointer, so scrolling the panel silently
+# changed settings the pointer passed over. These subclasses act on the
+# wheel only once the user has clicked (or tabbed) into the control;
+# otherwise they ignore the event, and Qt passes it on to the scroll
+# area, which scrolls the panel instead. The spinbox classes also make
+# sure every digit of their widest value is visible under napari's
+# stylesheet (see _fit_spinbox_hint and _apply_spinbox_min_width).
+# Every spinbox, combo box and slider in this module uses these
+# classes (test_widget.py checks that).
+
+
+def _require_click_focus(widget: QWidget) -> None:
+    # StrongFocus = click or Tab. Qt's default for these controls is
+    # WheelFocus, which lets the wheel itself grant focus and would
+    # defeat the hasFocus() check below.
+    widget.setFocusPolicy(Qt.StrongFocus)
+
+
+def _guarded_wheel_event(widget: QWidget, event, base_cls) -> None:
+    if widget.hasFocus():
+        base_cls.wheelEvent(widget, event)
+    else:
+        event.ignore()  # propagate to the parent scroll area
+
+
+# Room the spinbox's inner line edit needs beyond the text itself. Measured
+# under napari's stylesheet: 7 px (2 px padding + 1 px margin per side,
+# plus the cursor); 3 px extra for safety.
+SPINBOX_TEXT_SLACK_PX = 10
+
+
+def _spinbox_text_width(spin) -> int:
+    """Pixel width of the widest text the spinbox can display."""
+    fm = spin.fontMetrics()
+    texts = [
+        spin.prefix() + spin.textFromValue(v) + spin.suffix()
+        for v in (spin.minimum(), spin.maximum())
+    ]
+    if spin.specialValueText():
+        texts.append(spin.specialValueText())
+    return max(fm.horizontalAdvance(t) for t in texts)
+
+
+def _spinbox_text_room(spin, width: int, height: int) -> int:
+    """Width (px) of the spinbox's text field at the given size, as the
+    active style lays it out, excluding any part a button covers."""
+    opt = QStyleOptionSpinBox()
+    spin.initStyleOption(opt)
+    opt.rect = QRect(0, 0, width, height)
+    style = spin.style()
+
+    def rect(sc):
+        return style.subControlRect(QStyle.CC_SpinBox, opt, sc, spin)
+
+    field = rect(QStyle.SC_SpinBoxEditField)
+    left, right = field.left(), field.right()
+    for btn in (rect(QStyle.SC_SpinBoxUp), rect(QStyle.SC_SpinBoxDown)):
+        if btn.width() <= 0 or not btn.intersects(field):
+            continue
+        if btn.center().x() < field.center().x():
+            left = max(left, btn.right() + 1)
+        else:
+            right = min(right, btn.left() - 1)
+    return right - left + 1
+
+
+def _fit_spinbox_hint(spin, hint: QSize) -> QSize:
+    """Widen a spinbox size hint until its widest value fits.
+
+    Qt's stylesheet engine sizes a spinbox for ONE button column, but
+    napari's stylesheet puts - and + on opposite sides, so at its own
+    size hint the text field is one button (~20 px) too narrow
+    (measured: "10000.0000" and "1000000000.00" each lost 21 px).
+    Short values hid this, because napari's ``min-width: 70px`` pads
+    their hint. This asks the active style how wide the text field
+    really is at the hinted size and adds whatever is missing.
+    """
+    try:
+        room = _spinbox_text_room(spin, hint.width(), hint.height())
+        need = _spinbox_text_width(spin) + SPINBOX_TEXT_SLACK_PX
+        missing = need - room
+    except Exception:  # sizing must never break the panel
+        return hint
+    if missing > 0:
+        return QSize(hint.width() + missing, hint.height())
+    return hint
+
+
+def _spinbox_min_width(spin) -> int:
+    """Narrowest width (px) at which the spinbox's widest value still
+    shows in full: text + slack + whatever the style spends on padding
+    and buttons (that overhead doesn't depend on the width)."""
+    try:
+        hint = spin.sizeHint()
+        chrome = hint.width() - _spinbox_text_room(
+            spin, hint.width(), hint.height()
+        )
+        return _spinbox_text_width(spin) + SPINBOX_TEXT_SLACK_PX + chrome
+    except Exception:  # never break the panel; just don't shrink it
+        return spin.sizeHint().width()
+
+
+def _apply_spinbox_min_width(spin) -> None:
+    """Set the spinbox's minimum width to what its widest value needs.
+
+    napari's stylesheet gives every spinbox ``min-width: 70px`` (90 px
+    with padding), and Qt lets a layout squeeze a widget down to an
+    explicit minimum even below its size hint. In a crowded row that
+    cut digits off (measured: the manual threshold box got 97 of the
+    115 px it needs, hiding 13 px of "0.0825"). Replacing that fixed
+    90 px with each box's real requirement still lets small boxes (Z
+    range: "16") shrink, but never far enough to hide a digit. The
+    stylesheet re-applies its value whenever it re-polishes the widget,
+    and the requirement changes with the range, so this re-runs after
+    those events and setters.
+    """
+    need = _spinbox_min_width(spin)
+    if spin.minimumWidth() != need:
+        spin.setMinimumWidth(need)
+
+
+_SPIN_REPOLISH_EVENTS = (
+    QEvent.Polish,
+    QEvent.StyleChange,
+    QEvent.FontChange,
+    QEvent.EnabledChange,
+    QEvent.Show,
+)
+
+
+class _FullValueSpinMixin:
+    """Spinbox sizing shared by ScrollSafeSpinBox and
+    ScrollSafeDoubleSpinBox: the size hint fits the widest value, and
+    no layout can squeeze the box below what that value needs."""
+
+    def sizeHint(self):  # noqa: N802
+        return _fit_spinbox_hint(self, super().sizeHint())
+
+    def minimumSizeHint(self):  # noqa: N802
+        return _fit_spinbox_hint(self, super().minimumSizeHint())
+
+    def event(self, event):
+        handled = super().event(event)
+        if event.type() in _SPIN_REPOLISH_EVENTS:
+            _apply_spinbox_min_width(self)
+        return handled
+
+    # Anything that changes the widest displayable text.
+    def setRange(self, *args):  # noqa: N802
+        super().setRange(*args)
+        _apply_spinbox_min_width(self)
+
+    def setMinimum(self, *args):  # noqa: N802
+        super().setMinimum(*args)
+        _apply_spinbox_min_width(self)
+
+    def setMaximum(self, *args):  # noqa: N802
+        super().setMaximum(*args)
+        _apply_spinbox_min_width(self)
+
+    def setDecimals(self, *args):  # noqa: N802 (QDoubleSpinBox only)
+        super().setDecimals(*args)
+        _apply_spinbox_min_width(self)
+
+    def setPrefix(self, *args):  # noqa: N802
+        super().setPrefix(*args)
+        _apply_spinbox_min_width(self)
+
+    def setSuffix(self, *args):  # noqa: N802
+        super().setSuffix(*args)
+        _apply_spinbox_min_width(self)
+
+    def setSpecialValueText(self, *args):  # noqa: N802
+        super().setSpecialValueText(*args)
+        _apply_spinbox_min_width(self)
+
+
+class ScrollSafeSpinBox(_FullValueSpinMixin, QSpinBox):
+    """QSpinBox: wheel only when focused; every digit always visible."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _require_click_focus(self)
+
+    def wheelEvent(self, event):  # noqa: N802 (Qt naming)
+        _guarded_wheel_event(self, event, QSpinBox)
+
+
+class ScrollSafeDoubleSpinBox(_FullValueSpinMixin, QDoubleSpinBox):
+    """QDoubleSpinBox: wheel only when focused; every digit (all
+    decimals) always visible."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _require_click_focus(self)
+
+    def wheelEvent(self, event):  # noqa: N802
+        _guarded_wheel_event(self, event, QDoubleSpinBox)
+
+
+class ScrollSafeComboBox(QComboBox):
+    """QComboBox that only reacts to the mouse wheel when focused."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _require_click_focus(self)
+
+    def wheelEvent(self, event):  # noqa: N802
+        _guarded_wheel_event(self, event, QComboBox)
+
+
+class ScrollSafeSlider(QSlider):
+    """QSlider that only reacts to the mouse wheel when focused."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _require_click_focus(self)
+
+    def wheelEvent(self, event):  # noqa: N802
+        _guarded_wheel_event(self, event, QSlider)
 
 
 # -----------------------------
@@ -859,7 +1088,7 @@ class SignalIntensityComparisonsDialog(QDialog):
         enabled_cb.setChecked(bool(comp.get("enabled", True)))
         self.table.setCellWidget(r, 0, enabled_cb)
 
-        src_combo = QComboBox()
+        src_combo = ScrollSafeComboBox()
         src_combo.addItems(
             [
                 f"{i+1}: {self.channel_labels[i]}"
@@ -869,7 +1098,7 @@ class SignalIntensityComparisonsDialog(QDialog):
         src_combo.setCurrentIndex(int(comp.get("source_ch", 0)))
         self.table.setCellWidget(r, 1, src_combo)
 
-        base_mode_combo = QComboBox()
+        base_mode_combo = ScrollSafeComboBox()
         base_mode_combo.addItems(["Union", "Intersection", "Contacts"])
         base_mode = comp.get("mode", "Union")
         base_mode_combo.setCurrentText(
@@ -888,7 +1117,7 @@ class SignalIntensityComparisonsDialog(QDialog):
         )
         self.table.setItem(r, 3, base_item)
 
-        sub_mode_combo = QComboBox()
+        sub_mode_combo = ScrollSafeComboBox()
         sub_mode_combo.addItems(["None", "Union", "Intersection", "Contacts"])
         sub_mode = comp.get("subtract_mode", "None")
         sub_mode_combo.setCurrentText(
@@ -1397,7 +1626,7 @@ class OrganelleContactWidget(QWidget):
             "below is only included once the threshold reaches that "
             "ratio."
         )
-        self.ct_slider = QSlider(Qt.Horizontal)
+        self.ct_slider = ScrollSafeSlider(Qt.Horizontal)
         self.ct_slider.setMinimum(0)
         self.ct_slider.setMaximum(100 * self.CT_SLIDER_STEPS_PER_PX)
         self.ct_slider.setValue(
@@ -1445,7 +1674,7 @@ class OrganelleContactWidget(QWidget):
             self._on_voxel_calibration_changed
         )
 
-        self.z_step_spinbox = QDoubleSpinBox()
+        self.z_step_spinbox = ScrollSafeDoubleSpinBox()
         self.z_step_spinbox.setDecimals(4)
         self.z_step_spinbox.setMinimum(0.0001)
         self.z_step_spinbox.setMaximum(10000.0)
@@ -1459,7 +1688,7 @@ class OrganelleContactWidget(QWidget):
             lambda _: self._on_voxel_calibration_changed()
         )
 
-        self.xy_pixel_spinbox = QDoubleSpinBox()
+        self.xy_pixel_spinbox = ScrollSafeDoubleSpinBox()
         self.xy_pixel_spinbox.setDecimals(4)
         self.xy_pixel_spinbox.setMinimum(0.0001)
         self.xy_pixel_spinbox.setMaximum(10000.0)
@@ -1474,7 +1703,7 @@ class OrganelleContactWidget(QWidget):
         )
 
         self.channels_label = QLabel("Channels:")
-        self.channel_mode_combo = QComboBox()
+        self.channel_mode_combo = ScrollSafeComboBox()
         self.channel_mode_combo.addItems(["2", "3", "4"])
         self.channel_mode_combo.setToolTip(
             "How many image layers to treat as channels for analysis."
@@ -1487,8 +1716,8 @@ class OrganelleContactWidget(QWidget):
         )
 
         self.z_range_label = QLabel("Range:")
-        self.z_min_spinbox = QSpinBox()
-        self.z_max_spinbox = QSpinBox()
+        self.z_min_spinbox = ScrollSafeSpinBox()
+        self.z_max_spinbox = ScrollSafeSpinBox()
         self.z_min_spinbox.setMinimum(0)
         self.z_max_spinbox.setMinimum(0)
 
@@ -1560,7 +1789,7 @@ class OrganelleContactWidget(QWidget):
             label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
             self.per_channel_label_widgets.append(label)
 
-            mode_combo = QComboBox()
+            mode_combo = ScrollSafeComboBox()
             mode_combo.addItems(["Automatic", "Manual", THRESH_MODE_RAW])
             mode_combo.setToolTip(
                 "Automatic: a method picks the cutoff per image.\n"
@@ -1578,7 +1807,7 @@ class OrganelleContactWidget(QWidget):
             line1.addStretch(1)
             row_outer.addLayout(line1)
 
-            auto_combo = QComboBox()
+            auto_combo = ScrollSafeComboBox()
             auto_combo.addItems(
                 ["Otsu", "Li", "Mean", "Minimum", "Triangle", "Yen", "Isodata"]
             )
@@ -1587,7 +1816,7 @@ class OrganelleContactWidget(QWidget):
                 lambda _: self._save_settings()
             )
 
-            manual_spin = QDoubleSpinBox()
+            manual_spin = ScrollSafeDoubleSpinBox()
             manual_spin.setRange(0.0, 1.0)
             # Qt's default is 2 decimals, which snapped the threshold to
             # 1% steps of the channel's range -- too coarse, since useful
@@ -1604,20 +1833,7 @@ class OrganelleContactWidget(QWidget):
             self.per_channel_manual.append(manual_spin)
             manual_spin.valueChanged.connect(lambda _: self._save_settings())
 
-            # Line 2: the Automatic method and Manual value, split onto
-            # their own line (rather than crammed alongside line 1) so
-            # this fits in a narrow napari dock without a horizontal
-            # scrollbar.
-            line2 = QHBoxLayout()
-            line2.addWidget(QLabel("Auto:"))
-            line2.addWidget(auto_combo)
-            line2.addWidget(QLabel("Manual:"))
-            line2.addWidget(manual_spin)
-            row_outer.addLayout(line2)
-
-            # Line 3: raw-intensity cutoff, and the cutoff the last run
-            # actually applied on both scales.
-            raw_spin = QDoubleSpinBox()
+            raw_spin = ScrollSafeDoubleSpinBox()
             raw_spin.setRange(0.0, 1.0e9)
             raw_spin.setDecimals(2)
             raw_spin.setSingleStep(1.0)
@@ -1630,11 +1846,23 @@ class OrganelleContactWidget(QWidget):
             raw_spin.setEnabled(False)
             self.per_channel_raw.append(raw_spin)
             raw_spin.valueChanged.connect(lambda _: self._save_settings())
-            line3 = QHBoxLayout()
-            line3.addWidget(QLabel("Raw:"))
-            line3.addWidget(raw_spin)
-            line3.addStretch(1)
-            row_outer.addLayout(line3)
+
+            # Auto method, Manual value and Raw cutoff, one per line.
+            # Side by side they were wider than a napari dock, and
+            # since the panel never scrolls sideways the layout
+            # squeezed the spinboxes and cut off their digits.
+            values = QGridLayout()
+            for r, (text, control) in enumerate(
+                (
+                    ("Auto:", auto_combo),
+                    ("Manual:", manual_spin),
+                    ("Raw:", raw_spin),
+                )
+            ):
+                values.addWidget(QLabel(text), r, 0)
+                values.addWidget(control, r, 1, alignment=Qt.AlignLeft)
+            values.setColumnStretch(2, 1)
+            row_outer.addLayout(values)
 
             info = QLabel("Last run: -")
             info.setWordWrap(True)
@@ -1819,7 +2047,7 @@ class OrganelleContactWidget(QWidget):
             self.show_body_labels_btns.append(b)
 
         self.min_body_size_label = QLabel("Minimum Body Size (px):")
-        self.min_body_size_spinbox = QSpinBox()
+        self.min_body_size_spinbox = ScrollSafeSpinBox()
         self.min_body_size_spinbox.setMinimum(1)
         self.min_body_size_spinbox.setMaximum(100000)
         self.min_body_size_spinbox.setValue(2)
@@ -1860,7 +2088,7 @@ class OrganelleContactWidget(QWidget):
             self._on_filter_threshold_mask_changed
         )
 
-        self.junction_merge_spinbox = QDoubleSpinBox()
+        self.junction_merge_spinbox = ScrollSafeDoubleSpinBox()
         self.junction_merge_spinbox.setRange(0.0, 50.0)
         self.junction_merge_spinbox.setSingleStep(0.5)
         self.junction_merge_spinbox.setDecimals(1)
@@ -2072,11 +2300,18 @@ class OrganelleContactWidget(QWidget):
 
         contact_group_layout.addWidget(self.voxel_calibration_status_label)
         contact_group_layout.addWidget(self.manual_voxel_calibration_checkbox)
-        voxel_cal_layout = QHBoxLayout()
-        voxel_cal_layout.addWidget(QLabel("Z step:"))
-        voxel_cal_layout.addWidget(self.z_step_spinbox)
-        voxel_cal_layout.addWidget(QLabel("XY pixel:"))
-        voxel_cal_layout.addWidget(self.xy_pixel_spinbox)
+        # One per line: side by side the two spinboxes were wider than
+        # a napari dock (see the threshold rows above).
+        voxel_cal_layout = QGridLayout()
+        voxel_cal_layout.addWidget(QLabel("Z step:"), 0, 0)
+        voxel_cal_layout.addWidget(
+            self.z_step_spinbox, 0, 1, alignment=Qt.AlignLeft
+        )
+        voxel_cal_layout.addWidget(QLabel("XY pixel:"), 1, 0)
+        voxel_cal_layout.addWidget(
+            self.xy_pixel_spinbox, 1, 1, alignment=Qt.AlignLeft
+        )
+        voxel_cal_layout.setColumnStretch(2, 1)
         contact_group_layout.addLayout(voxel_cal_layout)
 
         contact_group_layout.addWidget(self.analyze_button)
@@ -3031,7 +3266,7 @@ class OrganelleContactWidget(QWidget):
         for ch in range(n):
             row = QHBoxLayout()
             row.addWidget(QLabel(f"Channel {ch+1}:"))
-            cb = QComboBox()
+            cb = ScrollSafeComboBox()
             cb.addItems([f"{i}: {lyr.name}" for i, lyr in enumerate(layers)])
             default_idx = int(
                 np.clip(self.channel_layer_indices[ch], 0, len(layers) - 1)
@@ -3105,19 +3340,19 @@ class OrganelleContactWidget(QWidget):
         form = QGridLayout()
 
         length_label = QLabel("Length:")
-        length_spin = QDoubleSpinBox()
+        length_spin = ScrollSafeDoubleSpinBox()
         length_spin.setRange(0.01, 1000000.0)
         length_spin.setDecimals(2)
         length_spin.setSingleStep(1.0)
         length_spin.setValue(float(self.saved_scale_bar_length))
 
         unit_label = QLabel("Unit:")
-        unit_combo = QComboBox()
+        unit_combo = ScrollSafeComboBox()
         unit_combo.addItems(["px", "µm"])
         unit_combo.setCurrentText(self.saved_scale_bar_unit)
 
         text_label = QLabel("Text Size:")
-        text_spin = QSpinBox()
+        text_spin = ScrollSafeSpinBox()
         text_spin.setRange(1, 200)
         text_spin.setValue(int(self.saved_scale_bar_text_size))
 
