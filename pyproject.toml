@@ -30,7 +30,11 @@ dependencies = [
     # importing skimage failed ("numpy.dtype size changed ... Expected 96
     # from C header, got 88"). scikit-image <0.24 is built against
     # NumPy 1.x. Revisit once every dependency supports NumPy 2.
-    "numpy<2",
+    # >=1.26: the first NumPy with Python 3.12 wheels. Without this floor,
+    # pip's resolver backtracked (through aicsimageio's old dask pins) to
+    # numpy 1.24.0, which has no 3.12 wheel, tried to compile it from
+    # source and crashed ("Cannot import 'setuptools.build_meta'").
+    "numpy>=1.26,<2",
     "magicgui",
     "qtpy",
     # >=0.20: regionprops.perimeter_crofton (Form Factor) and the
