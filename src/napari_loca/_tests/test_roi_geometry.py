@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from napari_organelle_contact_analyzer import _widget as W
+from napari_loca import _widget as W
 
 GEOM = W.compute_roi_geometry
 PERIM = W.polygon_perimeter

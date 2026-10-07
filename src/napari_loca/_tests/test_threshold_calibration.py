@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from napari_organelle_contact_analyzer import _widget as W
+from napari_loca import _widget as W
 
 
 # ---------------------------------------------------- normalization

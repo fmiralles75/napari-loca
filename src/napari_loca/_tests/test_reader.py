@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from napari_organelle_contact_analyzer import _reader as R
+from napari_loca import _reader as R
 
 
 def encoded(sizes):

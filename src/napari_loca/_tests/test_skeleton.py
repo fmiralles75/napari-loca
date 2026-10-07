@@ -10,7 +10,7 @@ it must never pass silently again.
 import numpy as np
 import pytest
 
-from napari_organelle_contact_analyzer import _widget as W
+from napari_loca import _widget as W
 
 SJ = W.OrganelleContactWidget._skeleton_and_junctions
 GJ = W.OrganelleContactWidget._group_junctions

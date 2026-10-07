@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from napari_organelle_contact_analyzer._tests.conftest import (
+from napari_loca._tests.conftest import (
     _make_harness,
     run_pipeline,
 )

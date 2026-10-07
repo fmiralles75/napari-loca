@@ -1,5 +1,5 @@
 """
-napari-organelle-contact-analyzer widget.
+LocA (napari-loca) widget.
 
 Implements the main ``OrganelleContactWidget`` used to threshold organelle
 signal channels, compute contact/overlap metrics between them, and export
@@ -95,6 +95,9 @@ AUTO_METHODS = {
 # type handling (particularly for bools) is inconsistent across
 # platforms/backends -- JSON gives an exact, portable round-trip
 # instead.
+# Deliberately still the pre-rename package name: QSettings stores saved
+# widget settings under this key, so changing it would silently reset
+# every user's saved thresholds and options after the napari-loca rename.
 SETTINGS_ORG = "napari-organelle-contact-analyzer"
 SETTINGS_APP = "OrganelleContactWidget"
 SETTINGS_KEY = "widget_state_json"

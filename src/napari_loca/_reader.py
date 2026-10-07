@@ -1,5 +1,5 @@
 """
-Reader contribution for napari-organelle-contact-analyzer.
+Reader contribution for LocA (napari-loca).
 
 Uses aicsimageio (https://github.com/AllenCellModeling/aicsimageio) to open
 microscopy images. With the dependencies declared in ``pyproject.toml``,
@@ -25,6 +25,7 @@ was built around in the first place, rather than one combined
 multi-channel array.
 """
 
+import contextlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -81,10 +82,8 @@ def napari_get_reader(path: Union[str, List[str]]):
         return None
     finally:
         if test_img is not None and hasattr(test_img, "close"):
-            try:
+            with contextlib.suppress(Exception):
                 test_img.close()
-            except Exception:
-                pass
 
     return reader_function
 
@@ -279,7 +278,5 @@ def _read_with_aicsimageio(path: str):
         return [(data, add_kwargs, "image")]
     finally:
         if img is not None and hasattr(img, "close"):
-            try:
+            with contextlib.suppress(Exception):
                 img.close()
-            except Exception:
-                pass

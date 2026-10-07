@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from napari_organelle_contact_analyzer import _widget as W
+from napari_loca import _widget as W
 
 
 class FakeFileDialog:
@@ -87,7 +87,7 @@ def test_unique_sheet_names(make_harness):
 
 
 def _metric_names(two_labels):
-    from napari_organelle_contact_analyzer._tests.conftest import (
+    from napari_loca._tests.conftest import (
         _make_harness,
         run_pipeline,
     )
@@ -272,7 +272,7 @@ def test_append_to_prism_workbook(make_harness, dialogs, tmp_path):
 
 # ---------------------------------------------------- add_analysis
 def test_add_analysis_labels_rois_sequentially(make_harness):
-    from napari_organelle_contact_analyzer._tests.conftest import (
+    from napari_loca._tests.conftest import (
         FakeCheck,
         FakeLineEdit,
     )

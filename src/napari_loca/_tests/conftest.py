@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 import pytest
 
-from napari_organelle_contact_analyzer import _widget as W
+from napari_loca import _widget as W
 
 # Every metric family, switched on (Morphology is off by default in
 # the plugin; the tests want all of it).

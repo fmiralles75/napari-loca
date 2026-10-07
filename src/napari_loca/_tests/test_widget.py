@@ -16,11 +16,11 @@ import pytest
 pytest.importorskip("napari.layers")
 pytest.importorskip("pytestqt")
 
-from napari_organelle_contact_analyzer import _widget as W  # noqa: E402
-from napari_organelle_contact_analyzer._tests.conftest import (  # noqa: E402
+from napari_loca import _widget as W  # noqa: E402
+from napari_loca._tests.conftest import (  # noqa: E402
     ALL_OUTPUTS,
 )
-from napari_organelle_contact_analyzer._tests.test_golden import (  # noqa
+from napari_loca._tests.test_golden import (  # noqa
     EXPECTED,
     PHANTOM,
 )

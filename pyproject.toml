@@ -1,7 +1,7 @@
 [project]
-name = "napari-organelle-contact-analyzer"
+name = "napari-loca"
 dynamic = ["version"]
-description = "A plugin to analyze signal contacts within the cell at a designated threshold distance."
+description = "LocA (Colocalization Analysis): organelle colocalization, contact and morphology analysis for napari."
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [
@@ -81,8 +81,8 @@ dependencies = [
 # Python 3.12 pip found no usable wheel alongside LocA's other pins and
 # tried (and failed) to build it from source. Without these, ND2/TIFF/OME-TIFF still open;
 # a .czi/.lif file is simply not claimed by this reader.
-#   pip install "napari-organelle-contact-analyzer[czi]"   (Zeiss)
-#   pip install "napari-organelle-contact-analyzer[lif]"   (Leica)
+#   pip install "napari-loca[czi]"   (Zeiss)
+#   pip install "napari-loca[lif]"   (Leica)
 czi = ["aicspylibczi>=3.1.1"]
 lif = ["readlif>=0.6.4"]
 all-formats = ["aicspylibczi>=3.1.1", "readlif>=0.6.4"]
@@ -96,13 +96,13 @@ testing = [
 ]
 
 [project.entry-points."napari.manifest"]
-napari-organelle-contact-analyzer = "napari_organelle_contact_analyzer:napari.yaml"
+napari-loca = "napari_loca:napari.yaml"
 
 [project.urls]
-"Bug Tracker" = "https://github.com/fmiralles75/napari-organelle-contact-analyzer/issues"
-"Documentation" = "https://github.com/fmiralles75/napari-organelle-contact-analyzer#README.md"
-"Source Code" = "https://github.com/fmiralles75/napari-organelle-contact-analyzer"
-"User Support" = "https://github.com/fmiralles75/napari-organelle-contact-analyzer/issues"
+"Bug Tracker" = "https://github.com/fmiralles75/napari-loca/issues"
+"Documentation" = "https://github.com/fmiralles75/napari-loca#README.md"
+"Source Code" = "https://github.com/fmiralles75/napari-loca"
+"User Support" = "https://github.com/fmiralles75/napari-loca/issues"
 
 [build-system]
 requires = ["setuptools>=42.0.0", "wheel", "setuptools_scm"]
@@ -118,7 +118,7 @@ where = ["src"]
 "*" = ["*.yaml"]
 
 [tool.setuptools_scm]
-write_to = "src/napari_organelle_contact_analyzer/_version.py"
+write_to = "src/napari_loca/_version.py"
 
 [tool.black]
 line-length = 79
@@ -176,5 +176,5 @@ fix = true
 # one body rather than crash napari; in _reader.py a file that can't be
 # opened must return None so napari falls back to another reader.
 [tool.ruff.lint.per-file-ignores]
-"src/napari_organelle_contact_analyzer/_widget.py" = ["BLE001"]
-"src/napari_organelle_contact_analyzer/_reader.py" = ["BLE001"]
+"src/napari_loca/_widget.py" = ["BLE001"]
+"src/napari_loca/_reader.py" = ["BLE001"]

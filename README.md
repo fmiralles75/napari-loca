@@ -1,69 +1,107 @@
-# napari-organelle-contact-analyzer
+# LocA: Colocalization & Organelle Contact Analysis for napari
 
-[![License Mozilla Public License 2.0](https://img.shields.io/pypi/l/napari-organelle-contact-analyzer.svg?color=green)](https://github.com/fmiralles75/napari-organelle-contact-analyzer/raw/main/LICENSE)
-[![PyPI](https://img.shields.io/pypi/v/napari-organelle-contact-analyzer.svg?color=green)](https://pypi.org/project/napari-organelle-contact-analyzer)
-[![Python Version](https://img.shields.io/pypi/pyversions/napari-organelle-contact-analyzer.svg?color=green)](https://python.org)
-[![tests](https://github.com/fmiralles75/napari-organelle-contact-analyzer/workflows/tests/badge.svg)](https://github.com/fmiralles75/napari-organelle-contact-analyzer/actions)
-[![codecov](https://codecov.io/gh/fmiralles75/napari-organelle-contact-analyzer/branch/main/graph/badge.svg)](https://codecov.io/gh/fmiralles75/napari-organelle-contact-analyzer)
-[![napari hub](https://img.shields.io/endpoint?url=https://api.napari-hub.org/shields/napari-organelle-contact-analyzer)](https://napari-hub.org/plugins/napari-organelle-contact-analyzer)
+[![License Mozilla Public License 2.0](https://img.shields.io/badge/license-MPL--2.0-green)](https://github.com/fmiralles75/napari-loca/raw/main/LICENSE)
+[![tests](https://github.com/fmiralles75/napari-loca/workflows/tests/badge.svg)](https://github.com/fmiralles75/napari-loca/actions)
 
-A plugin to analyze organelle contacts within the cell at a designated threshold distance.
+**LocA** (Colocalization Analysis) is a [napari] plugin that measures how
+organelles overlap, touch and are shaped in multichannel fluorescence images,
+from single images or confocal Z-stacks. It was built for quantifying
+organelle contact sites (e.g. Golgi–mitochondria) and mitochondrial network
+morphology, and exports results ready for statistics in Excel or GraphPad
+Prism.
 
-----------------------------------
+<!-- TODO: add a screenshot or short GIF of the widget on a real image, e.g.
+![LocA in napari](docs/images/loca-screenshot.png) -->
 
-This [napari] plugin was generated with [copier] using the [napari-plugin-template].
+## What it measures
 
-<!--
-Don't miss the full getting started guide to set up your new package:
-https://github.com/napari/napari-plugin-template#getting-started
+For 2–4 channels, per image or per hand-drawn ROI (e.g. per cell):
 
-and review the napari docs for plugin developers:
-https://napari.org/stable/plugins/index.html
--->
+| Group | Metrics |
+|---|---|
+| **Overlap** | Intersection, Union, Intersection/Union (Jaccard), Intersection / each channel's signal area |
+| **Contacts** | Contact Area within a user-set distance (Z weighted by the voxel calibration), Contact Site Count, Mean Contact Site Size, Contact Site nearest-neighbour distance, mean intensity at contacts |
+| **Per-channel area** | Signal Area, Body Count, Average Area per Body, Fragmentation Coefficient |
+| **Morphology** (opt-in) | Aspect Ratio and Form Factor per body; skeleton-based Branch Count, Junction Count and Branch Length; % of bodies / signal in branched bodies |
+| **Intensity** | Mean intensity per channel, plus custom comparisons (one channel's intensity inside another's mask, contacts, etc.) |
+| **Cell (ROI) shape** | Max/Min Feret diameter, Perimeter, Circularity, Roundness, Solidity (same definitions as Fiji) |
+
+Every exported row also records the threshold applied to each channel, both
+as a scaled value and in raw intensity units, so the analysis can be
+reported exactly in a methods section. Full definitions are in the widget
+under **Metric Descriptions**.
 
 ## Installation
 
-You can install `napari-organelle-contact-analyzer` via [pip]:
+LocA requires Python 3.10–3.12. Into an environment with napari:
 
-    pip install napari-organelle-contact-analyzer
+    pip install git+https://github.com/fmiralles75/napari-loca.git
 
+Nikon ND2, TIFF and OME-TIFF files open out of the box. Zeiss CZI and Leica
+LIF readers are GPL-licensed and therefore optional:
 
+    pip install "napari-loca[czi] @ git+https://github.com/fmiralles75/napari-loca.git"   # Zeiss
+    pip install "napari-loca[lif] @ git+https://github.com/fmiralles75/napari-loca.git"   # Leica
 
-To install latest development version :
+## Quick start
 
-    pip install git+https://github.com/fmiralles75/napari-organelle-contact-analyzer.git
+1. **Open your image** in napari (*File → Open*). LocA's reader splits
+   multichannel files into one layer per channel and carries over the
+   physical pixel and Z-step sizes.
+2. **Open the widget**: *Plugins → LocA - Colocalization & Contact Analysis*.
+3. **Channel & Image Setup**: choose 2, 3 or 4 channels and map each to a
+   layer. Check that the Z/XY calibration was detected (or enter it
+   manually).
+4. **Thresholding**: for each channel pick *Automatic* (Otsu, Li, …),
+   *Manual* (a fraction of that channel's intensity range) or
+   *Manual (raw intensity)* (the same detector-count cutoff in every image).
+   Use the same policy for every condition you compare.
+5. **Contact Analysis**: set the contact distance, optionally draw ROIs
+   (*Toggle ROI Selection*, tick *Calculate metrics per ROI*), and click
+   **Analyze**. Thresholded masks, skeletons and contacts can be shown as
+   layers to check them by eye.
+6. **Add Analysis** to store each result under a condition name, then
+   **Export to Excel** or **Export to GraphPad** (one sheet per metric, one
+   column per condition).
 
+## Validation
 
-## Contributing
+- **Automated tests**: 190+ tests check each metric against shapes with
+  hand-calculated answers (overlap areas, contact distances, skeleton
+  topology, branch lengths, aspect ratios, Feret diameters, exports), plus a
+  golden-file test that fails if any result on a fixed reference image
+  changes. They run on macOS, Windows and Linux with Python 3.10–3.12 on
+  every push.
+- **Comparison with established tools**: <!-- TODO: summarise your
+  MiNA and Coloc 2 / JACoP comparisons and imaging controls here. -->
 
-Contributions are very welcome. Tests can be run with [tox], please ensure
-the coverage at least stays the same before you submit a pull request.
+## Limitations
+
+- One threshold is applied per channel across the whole image, so cells of
+  very different brightness in the same field can segment differently.
+  Use ROIs, and check the thresholded layers.
+- Skeleton metrics (branches, junctions) depend on the segmentation; inspect
+  the Skeleton and Junction layers before trusting them.
+- With 3–4 channels, Contact Area requires all but one channel to overlap
+  exactly; three organelles close together without overlapping are not
+  counted.
+- Contact distances, lengths and Feret diameters are reported in XY pixels
+  (multiply by the pixel size for µm).
+
+## Citing
+
+If you use LocA, please cite this repository. <!-- TODO: add the Zenodo
+DOI once v0.1.0 is released. -->
+
+## Contributing and issues
+
+Bug reports and suggestions are welcome via
+[GitHub issues](https://github.com/fmiralles75/napari-loca/issues).
+To run the tests: `pip install -e ".[testing]"`, then `pytest -v src`.
 
 ## License
 
-Distributed under the terms of the [Mozilla Public License 2.0] license,
-"napari-organelle-contact-analyzer" is free and open source software
+Distributed under the [Mozilla Public License 2.0](LICENSE).
+LocA is free and open source software.
 
-## Issues
-
-If you encounter any problems, please [file an issue] along with a detailed description.
-
-[napari]: https://github.com/napari/napari
-[copier]: https://copier.readthedocs.io/en/stable/
-[@napari]: https://github.com/napari
-[MIT]: http://opensource.org/licenses/MIT
-[BSD-3]: http://opensource.org/licenses/BSD-3-Clause
-[GNU GPL v3.0]: http://www.gnu.org/licenses/gpl-3.0.txt
-[GNU LGPL v3.0]: http://www.gnu.org/licenses/lgpl-3.0.txt
-[Apache Software License 2.0]: http://www.apache.org/licenses/LICENSE-2.0
-[Mozilla Public License 2.0]: https://www.mozilla.org/media/MPL/2.0/index.txt
-[napari-plugin-template]: https://github.com/napari/napari-plugin-template
-
-[file an issue]: https://github.com/fmiralles75/napari-organelle-contact-analyzer/issues
-
-[napari]: https://github.com/napari/napari
-[tox]: https://tox.readthedocs.io/en/latest/
-[pip]: https://pypi.org/project/pip/
-[PyPI]: https://pypi.org/
-
-Yay it worked!
+[napari]: https://napari.org

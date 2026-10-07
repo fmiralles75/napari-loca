@@ -1,0 +1,36 @@
+# this file defines how your widgets are exposed to napari
+
+name: napari-loca
+display_name: LocA - Colocalization & Organelle Contact Analysis
+# use 'hidden' to remove plugin from napari hub search results
+visibility: public
+# see https://napari.org/stable/plugins/manifest.html for valid categories
+categories: ["Measurement", "Segmentation", "IO"]
+
+contributions:
+  commands:
+    - id: napari-loca.get_reader
+      python_name: napari_loca._reader:napari_get_reader
+      title: Open data with LocA
+
+    # Main widget only (cleaned dropdown)
+    - id: napari-loca.make_contact_analyzer
+      python_name: napari_loca._widget:OrganelleContactWidget
+      title: Make Contact Analyzer Widget
+
+    # - id: napari-loca.make_contact_filter
+    #   python_name: napari_loca.widget:contact_filter_widget
+    #   title: Make Contact Filter Widget
+
+  readers:
+    - command: napari-loca.get_reader
+      accepts_directories: false
+      filename_patterns: ['*.tif', '*.tiff', '*.ome.tif', '*.ome.tiff', '*.nd2', '*.czi', '*.lif']
+
+  widgets:
+    - command: napari-loca.make_contact_analyzer
+      display_name: LocA - Colocalization & Contact Analysis
+      autogenerate: false
+
+#   - command: napari-loca.make_contact_filter
+#     display_name: Contact Filter

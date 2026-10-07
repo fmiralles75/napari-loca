@@ -7,8 +7,8 @@ axis-aligned boxes, so areas and distances are exact integers.
 import numpy as np
 import pytest
 
-from napari_organelle_contact_analyzer import _widget as W
-from napari_organelle_contact_analyzer._tests.conftest import box
+from napari_loca import _widget as W
+from napari_loca._tests.conftest import box
 
 
 def contacts_for(masks, t, z_ratio=1.0):
