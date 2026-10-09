@@ -149,13 +149,15 @@ def run_pipeline(
     contact_threshold: float = 0.0,
     z_xy_ratio: float = 1.0,
     labels=None,
+    focus=None,
 ):
     """Same sequence of steps as OrganelleContactWidget.analyze_contacts
     (full-image mode, no ROI): normalize -> threshold -> optional
     small-body mask filter -> distance maps -> contacts -> metrics bundle
     + threshold columns. ``thresholds`` entries: a float (Manual, scaled
     0-1), None (Automatic, Otsu), or ("raw", value) for
-    Manual (raw intensity)."""
+    Manual (raw intensity). ``focus``: Focus channel contacts method
+    (channel index), or None for Overlap-based."""
     n = len(images)
     labels = labels or [f"Ch{i + 1}" for i in range(n)]
     raws = [np.asarray(im) for im in images]
@@ -180,7 +182,7 @@ def run_pipeline(
         used.append((t_scaled, t_raw))
         masks.append(m)
         dists.append(W.contact_distance_map(m, z_xy_ratio))
-    contacts = W.compute_contacts(masks, dists, contact_threshold)
+    contacts = W.compute_contacts(masks, dists, contact_threshold, focus=focus)
     metrics = harness._compute_metrics_bundle(
         raw_signals=raws,
         masks=masks,

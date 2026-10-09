@@ -750,15 +750,52 @@ def contact_distance_map(mask: np.ndarray, z_xy_ratio: float) -> np.ndarray:
     return distance_transform_edt(~mask, sampling=sampling)
 
 
+# How contacts are defined when 3-4 channels are analyzed (see
+# compute_contacts and the "Contact Area" glossary entry). With 2 channels
+# both reduce to the same symmetric definition, so the choice only
+# applies to 3-4 channels.
+CONTACT_METHOD_OVERLAP = "Overlap-based"
+CONTACT_METHOD_FOCUS = "Focus channel"
+CONTACT_METHODS = (CONTACT_METHOD_OVERLAP, CONTACT_METHOD_FOCUS)
+
+
 def compute_contacts(
-    masks: List[np.ndarray], dists: List[np.ndarray], threshold: float
+    masks: List[np.ndarray],
+    dists: List[np.ndarray],
+    threshold: float,
+    focus: Optional[int] = None,
 ) -> np.ndarray:
-    """Contact voxels: for each channel i, voxels lying within
-    ``threshold`` of channel i's mask *and* inside every other
-    channel's mask; the union over i. With two channels this is "voxels
-    of one channel within ``threshold`` of the other". ``threshold`` = 0
-    reduces exactly to the intersection."""
+    """Contact voxels between thresholded channel masks.
+
+    ``dists[i]`` is channel i's distance map (contact_distance_map).
+
+    Overlap-based (``focus`` None, the default): for each channel i,
+    the voxels inside *every other* channel's mask that lie within
+    ``threshold`` of channel i; the union over i. So all channels but
+    one must overlap exactly, and only the remaining one gets the
+    distance tolerance. With two channels this is "voxels of either
+    channel within ``threshold`` of the other".
+
+    Focus channel (``focus`` = a channel index): the voxels of the focus
+    channel's mask that lie within ``threshold`` of *every* other
+    channel. Contacts therefore always sit on the focus organelle, and
+    the other channels need not overlap each other.
+
+    With ``threshold`` = 0 both reduce exactly to the intersection of
+    all channels."""
     n = len(masks)
+    if focus is not None:
+        focus = int(focus)
+        if not 0 <= focus < n:
+            raise ValueError(
+                f"focus channel {focus} out of range for {n} channels"
+            )
+        contacts = masks[focus].copy()
+        for j in range(n):
+            if j != focus:
+                contacts &= dists[j] <= threshold
+        return contacts
+
     contacts = np.zeros_like(masks[0], dtype=bool)
     for i in range(n):
         others = None
@@ -809,9 +846,39 @@ simultaneously thresholded-positive (logical AND across channels).</p>
 thresholded-positive (logical OR across channels).</p>
 <p><b>Intersection/Union (Contact Coefficient)</b> &mdash; the Jaccard
 index of the two above, a normalized 0-1 overlap score.</p>
-<p><b>Contact Area</b> &mdash; pixel count where a channel's signal sits
-within the Contact Threshold distance of every other channel's signal
-(a distance-tolerant version of intersection, not a strict AND).</p>
+<p><b>Contact Area</b> &mdash; pixel count of the contact region: a
+distance-tolerant version of Intersection. Distances are measured
+between thresholded masks, in XY pixels (see the Z/XY note below). How
+the region is defined depends on the number of channels:</p>
+<ul>
+<li><i>2 channels:</i> the voxels of either channel that lie within the
+Contact Threshold of the other channel. The region therefore covers both
+organelles' signal on either side of a gap.</li>
+<li><i>3&ndash;4 channels, Contacts method "Overlap-based"</i> (default):
+a voxel counts when every channel but one is present there (their masks
+overlap exactly at that voxel) and the remaining channel lies within the
+Contact Threshold. Each channel is tried as the remaining one and the
+results are combined. At least all-but-one channels must truly overlap,
+so organelles that sit close together without overlapping each other
+register no contact.</li>
+<li><i>3&ndash;4 channels, Contacts method "Focus channel":</i> a voxel of
+the chosen focus channel counts when <b>every</b> other channel lies
+within the Contact Threshold of it. The other channels need not overlap
+each other or the focus channel, so this captures three or four
+organelles clustered within the set distance. The region always lies on
+the focus channel's own signal, so Contact Area can be read against that
+channel's Signal Area.</li>
+</ul>
+<p>With a Contact Threshold of 0 px, every definition above reduces to
+the Intersection (voxels where all channels overlap). Contact Site
+Count, Mean Contact Site Size, Contact Site NN Distance, Contact Mean
+Intensity, the "Contacts" region in Signal Intensity Comparisons and the
+Contacts layer all use the same contact region.</p>
+<p><b>Contact Method</b> (3&ndash;4 channels only) &mdash; text column
+recording which method produced each row ("Overlap-based" or "Focus
+channel (<i>name</i>)"). Exported to Excel; not exported to Prism,
+which takes numbers only. Use one method across every condition you
+compare.</p>
 <p><i>Z/XY calibration:</i> on a Z-stack, "Threshold (px)" still means
 pixels of lateral (XY) distance, but the Z axis is weighted relative
 to XY using the image's calibration (Z step / XY pixel size), so a
@@ -926,7 +993,12 @@ signal area as a fraction of the ROI/image.</p>
 <p><b>Mean Intensity (per channel)</b> &mdash; average raw intensity
 within that channel's own thresholded mask.</p>
 <p><b>Contact Mean Intensity (per channel)</b> &mdash; average raw
-intensity within the Contact Area region.</p>
+intensity within the Contact Area region. With a Contact Threshold above
+0, the region includes voxels that belong to one channel but lie just
+outside another (e.g. one organelle's edge facing a neighbour across a
+gap), so that other channel's average includes some of its background.
+In Focus channel mode the focus channel's own average never does,
+because the region lies on its signal.</p>
 <p><b>Signal Intensity Comparisons</b> &mdash; your own configured
 comparisons (mean intensity of a source channel within a
 Union/Intersection/Contacts region, optionally minus another region).
@@ -1624,7 +1696,8 @@ class OrganelleContactWidget(QWidget):
             "for them to be counted as 'in contact'. Z steps count as "
             "the Z/XY ratio shown below, so a voxel directly above or "
             "below is only included once the threshold reaches that "
-            "ratio."
+            "ratio. With 3-4 channels, 'Contacts method' below sets "
+            "which channels the distance applies to."
         )
         self.ct_slider = ScrollSafeSlider(Qt.Horizontal)
         self.ct_slider.setMinimum(0)
@@ -1639,6 +1712,48 @@ class OrganelleContactWidget(QWidget):
         self.ct_text.setValidator(ct_validator)
         self.ct_text.setMaximumWidth(60)
         self.ct_text.editingFinished.connect(self.text_input_changed)
+
+        # How contacts are defined with 3-4 channels (see
+        # compute_contacts). Grayed out with 2 channels, where both
+        # methods are the same definition.
+        self.contact_method_label = QLabel("Contacts method:")
+        self.contact_method_combo = ScrollSafeComboBox()
+        self.contact_method_combo.addItems(list(CONTACT_METHODS))
+        self.contact_method_combo.setToolTip(
+            "Only used with 3-4 channels.\n"
+            "Overlap-based: a voxel is a contact when all channels but "
+            "one overlap there exactly and the remaining channel is "
+            "within the contact threshold (each channel is tried as the "
+            "remaining one).\n"
+            "Focus channel: a voxel of the focus channel is a contact "
+            "when every other channel is within the contact threshold "
+            "of it; the other channels need not overlap each other.\n"
+            "At a threshold of 0 px both count only voxels where all "
+            "channels overlap."
+        )
+        self.contact_method_combo.currentIndexChanged.connect(
+            lambda _: self._on_contact_method_changed()
+        )
+        self.contact_focus_label = QLabel("Focus channel:")
+        self.contact_focus_combo = ScrollSafeComboBox()
+        # Channel names can be long layer names: cap the width so the
+        # panel doesn't grow wider than the dock.
+        self.contact_focus_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.contact_focus_combo.setMinimumContentsLength(14)
+        self.contact_focus_combo.setToolTip(
+            "Focus channel method: contacts are this channel's voxels "
+            "lying within the contact threshold of every other channel."
+        )
+        # The focus channel the user picked, kept separately from the
+        # list's current index: dropping to fewer channels shrinks the
+        # list, and the choice must come back when the channel does
+        # rather than silently move to another channel.
+        self._contact_focus_wanted = 0
+        self.contact_focus_combo.currentIndexChanged.connect(
+            self._on_contact_focus_changed
+        )
 
         # Z/XY voxel calibration -- corrects the Contact Threshold's
         # proximity search so a step in Z isn't silently treated as the
@@ -2297,6 +2412,17 @@ class OrganelleContactWidget(QWidget):
         ct_layout.addWidget(self.ct_slider)
         ct_layout.addWidget(self.ct_text)
         contact_group_layout.addLayout(ct_layout)
+        contact_method_layout = QGridLayout()
+        contact_method_layout.addWidget(self.contact_method_label, 0, 0)
+        contact_method_layout.addWidget(
+            self.contact_method_combo, 0, 1, alignment=Qt.AlignLeft
+        )
+        contact_method_layout.addWidget(self.contact_focus_label, 1, 0)
+        contact_method_layout.addWidget(
+            self.contact_focus_combo, 1, 1, alignment=Qt.AlignLeft
+        )
+        contact_method_layout.setColumnStretch(2, 1)
+        contact_group_layout.addLayout(contact_method_layout)
 
         contact_group_layout.addWidget(self.voxel_calibration_status_label)
         contact_group_layout.addWidget(self.manual_voxel_calibration_checkbox)
@@ -2445,6 +2571,8 @@ class OrganelleContactWidget(QWidget):
             ],
             "per_channel_raw": [sp.value() for sp in self.per_channel_raw],
             "contact_threshold": self.threshold,
+            "contact_method_index": self.contact_method_combo.currentIndex(),
+            "contact_focus_index": self._contact_focus_wanted,
             "auto_adjust_z_range": (
                 self.auto_adjust_z_range_checkbox.isChecked()
             ),
@@ -2573,6 +2701,16 @@ class OrganelleContactWidget(QWidget):
             for i, v in enumerate(data.get("per_channel_raw", [])):
                 if i < len(self.per_channel_raw):
                     self.per_channel_raw[i].setValue(float(v))
+
+            if "contact_method_index" in data:
+                idx = int(data["contact_method_index"])
+                if 0 <= idx < self.contact_method_combo.count():
+                    self.contact_method_combo.setCurrentIndex(idx)
+            if "contact_focus_index" in data:
+                idx = int(data["contact_focus_index"])
+                if 0 <= idx < self.max_channels_supported:
+                    self._contact_focus_wanted = idx
+            self._refresh_contact_method_controls()
 
             if "contact_threshold" in data:
                 t = float(
@@ -3065,6 +3203,68 @@ class OrganelleContactWidget(QWidget):
                 self.per_channel_label_widgets[i].setText(txt)
                 self._apply_label_qol(self.per_channel_label_widgets[i], txt)
         self._sync_active_channel_row_states()
+        self._refresh_contact_method_controls()
+
+    # ---------------- Contacts method (3-4 channels) ----------------
+    def _refresh_contact_method_controls(self):
+        """Fill the Focus channel list with the active channels' names
+        (keeping the current choice where possible) and gray out what
+        doesn't apply: both controls with 2 channels, the focus list
+        unless the Focus channel method is selected."""
+        n = self._get_active_channel_count()
+        combo = self.contact_focus_combo
+        labels = self.get_channel_labels()
+        target = min(max(self._contact_focus_wanted, 0), len(labels) - 1)
+        items = [combo.itemText(i) for i in range(combo.count())]
+        if items != labels or combo.currentIndex() != target:
+            combo.blockSignals(True)
+            if items != labels:
+                combo.clear()
+                combo.addItems(labels)
+            combo.setCurrentIndex(target)
+            combo.blockSignals(False)
+        multi = n >= 3
+        focus_on = (
+            self.contact_method_combo.currentText() == CONTACT_METHOD_FOCUS
+        )
+        self.contact_method_label.setEnabled(multi)
+        self.contact_method_combo.setEnabled(multi)
+        self.contact_focus_label.setEnabled(multi and focus_on)
+        self.contact_focus_combo.setEnabled(multi and focus_on)
+
+    def _on_contact_method_changed(self):
+        self._refresh_contact_method_controls()
+        self._save_settings()
+
+    def _on_contact_focus_changed(self, idx: int):
+        if idx >= 0:
+            self._contact_focus_wanted = int(idx)
+        self._save_settings()
+
+    def _contact_focus_index(self, n: int) -> Optional[int]:
+        """Focus channel index for compute_contacts, or None for the
+        overlap-based method. Always None with fewer than 3 channels."""
+        if n < 3:
+            return None
+        if self.contact_method_combo.currentText() != CONTACT_METHOD_FOCUS:
+            return None
+        idx = self.contact_focus_combo.currentIndex()
+        return idx if 0 <= idx < n else 0
+
+    def _contact_method_columns(
+        self, n: int, ch_labels: List[str]
+    ) -> Dict[str, Any]:
+        """'Contact Method' column for 3-4 channel analyses, so every
+        exported row says which contact definition produced it. Not
+        added with 2 channels, where there is only one definition."""
+        if n < 3:
+            return {}
+        focus = self._contact_focus_index(n)
+        if focus is None:
+            return {"Contact Method": CONTACT_METHOD_OVERLAP}
+        return {
+            "Contact Method": f"{CONTACT_METHOD_FOCUS} ({ch_labels[focus]})"
+        }
 
     def _get_signals_for_analysis(
         self,
@@ -3527,7 +3727,10 @@ class OrganelleContactWidget(QWidget):
 
         self.last_masks = masks
 
-        contacts = compute_contacts(masks, dists, self.threshold)
+        contacts = compute_contacts(
+            masks, dists, self.threshold, focus=self._contact_focus_index(n)
+        )
+        method_cols = self._contact_method_columns(n, ch_labels)
 
         # The cutoff actually applied to each channel, on both scales,
         # shown next to the threshold controls and exported with every
@@ -3624,6 +3827,7 @@ class OrganelleContactWidget(QWidget):
                     roi_area=roi_area,
                 )
                 metrics.update(thr_cols)
+                metrics.update(method_cols)
                 metrics["ROI Number"] = idx
                 per_roi_metrics.append(metrics)
                 union_contacts |= restricted_contacts
@@ -3645,6 +3849,7 @@ class OrganelleContactWidget(QWidget):
                 roi_area=roi_area_full,
             )
             self.last_metrics.update(thr_cols)
+            self.last_metrics.update(method_cols)
             self._set_result_text_from_metrics(
                 self.last_metrics, prefix="Full image metrics:\n"
             )

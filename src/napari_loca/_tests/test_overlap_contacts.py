@@ -11,9 +11,9 @@ from napari_loca import _widget as W
 from napari_loca._tests.conftest import box
 
 
-def contacts_for(masks, t, z_ratio=1.0):
+def contacts_for(masks, t, z_ratio=1.0, focus=None):
     dists = [W.contact_distance_map(m, z_ratio) for m in masks]
-    return W.compute_contacts(masks, dists, t)
+    return W.compute_contacts(masks, dists, t, focus=focus)
 
 
 # ------------------------------------------------- overlap (2 channels)
@@ -183,25 +183,109 @@ def test_three_channels_threshold_zero_is_triple_intersection():
     assert np.array_equal(got, a & b & c)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DEFINITION MISMATCH for >=3 channels: the glossary says a contact "
-        "is a channel's signal within the threshold of EVERY other channel; "
-        "the code requires the voxel to lie INSIDE all other channels and "
-        "within the threshold of one. A thin channel sandwiched between two "
-        "others counts under the glossary but not the code. Decide which "
-        "is intended, then fix the code or the glossary and drop this."
-    ),
-)
-def test_three_channel_contact_matches_glossary_definition():
+def sandwich():
+    """A thin channel between two others that don't touch each other:
+    A = 1-px column at x=9, B = x 0-6 (3 px from A), C = x 12+ (3 px
+    from A, 6 px from B). The #6 case."""
     shape = (10, 20)
-    a = box(shape, (0, 9), (10, 10))  # 1-px column at x=9
-    b = box(shape, (0, 0), (10, 7))  # x 0-6  (2 px from A)
-    c = box(shape, (0, 12), (10, 20))  # x 12+  (3 px from A)
-    got = contacts_for([a, b, c], 3.0)
-    # Glossary: A's column is within 3 px of both B and C.
-    assert got[:, 9].all()
+    a = box(shape, (0, 9), (10, 10))
+    b = box(shape, (0, 0), (10, 7))
+    c = box(shape, (0, 12), (10, 20))
+    return a, b, c
+
+
+def test_overlap_based_needs_all_but_one_channel_to_overlap():
+    """Overlap-based (default) 3-channel definition, as in the glossary:
+    all channels but one overlap exactly, the last is within reach. B
+    and C never overlap and A overlaps neither, so nothing counts."""
+    assert contacts_for(list(sandwich()), 3.0).sum() == 0
+
+
+def test_overlap_based_counts_overlap_next_to_third_channel():
+    """A (x 0-9) and B (x 5-14) overlap at x 5-9; C (x 11-14) sits inside
+    B, 2 px from A. Contacts: the A&B overlap within 2 px of C (x 9),
+    plus the B&C overlap within 2 px of A (x 11)."""
+    shape = (4, 20)
+    a = box(shape, (0, 0), (4, 10))
+    b = box(shape, (0, 5), (4, 15))
+    c = box(shape, (0, 11), (4, 15))
+    got = contacts_for([a, b, c], 2.0)
+    assert set(np.unique(np.nonzero(got)[1])) == {9, 11}
+    assert got.sum() == 2 * 4
+
+
+def test_focus_channel_counts_sandwiched_channel():
+    """Focus channel = A: A's column is within 3 px of both B and C, so
+    all of it counts -- the case the overlap-based method misses."""
+    a, b, c = sandwich()
+    assert np.array_equal(contacts_for([a, b, c], 3.0, focus=0), a)
+    assert contacts_for([a, b, c], 2.99, focus=0).sum() == 0
+
+
+def test_focus_channel_needs_every_other_channel_within_threshold():
+    """Focus = B: B's edge (x=6) is 3 px from A but 6 px from C, so B has
+    no tripartite contact at 3 px. Same for C (6 px from B). At 6 px,
+    only B's edge column (x=6) is within reach of both A and C."""
+    a, b, c = sandwich()
+    assert contacts_for([a, b, c], 3.0, focus=1).sum() == 0
+    assert contacts_for([a, b, c], 3.0, focus=2).sum() == 0
+    got = contacts_for([a, b, c], 6.0, focus=1)
+    assert np.array_equal(got, box(a.shape, (0, 6), (10, 7)))  # x=6
+
+
+def test_focus_contacts_lie_on_focus_channel_and_grow_with_threshold():
+    rng = np.random.default_rng(0)
+    masks = [rng.random((6, 30, 30)) > 0.85 for _ in range(4)]
+    for f in range(4):
+        prev = None
+        for t in (0.0, 1.0, 1.5, 2.5, 4.0):
+            got = contacts_for(masks, t, z_ratio=1.443, focus=f)
+            assert not (got & ~masks[f]).any()
+            if prev is not None:
+                assert not (prev & ~got).any()  # never shrinks
+            prev = got
+
+
+@pytest.mark.parametrize("n", [3, 4])
+def test_threshold_zero_is_full_intersection_for_both_methods(n):
+    rng = np.random.default_rng(n)
+    masks = [rng.random((5, 25, 25)) > 0.4 for _ in range(n)]
+    inter = np.logical_and.reduce(masks)
+    assert inter.any()
+    assert np.array_equal(contacts_for(masks, 0.0), inter)
+    for f in range(n):
+        assert np.array_equal(contacts_for(masks, 0.0, focus=f), inter)
+
+
+def test_focus_channel_quadripartite():
+    """Four channels: A's column with partners 1, 2 and 3 px away. A
+    counts only once the threshold reaches the farthest partner."""
+    shape = (5, 30)
+    a = box(shape, (0, 10), (5, 11))
+    b = box(shape, (0, 0), (5, 9))  # x 0-8: 2 px
+    c = box(shape, (0, 13), (5, 20))  # 3 px
+    d = box(shape, (0, 11), (5, 12))  # 1 px
+    masks = [a, b, c, d]
+    assert contacts_for(masks, 2.99, focus=0).sum() == 0
+    assert np.array_equal(contacts_for(masks, 3.0, focus=0), a)
+
+
+def test_focus_channel_weights_z_by_voxel_ratio():
+    """Same Z rule as the overlap-based method: A's top plane is 2
+    planes from B, i.e. 2 * 1.5 = 3.0 px; C overlaps A."""
+    shape = (12, 8, 8)
+    a = box(shape, (0, 2, 2), (5, 6, 6))  # planes 0-4
+    b = box(shape, (6, 2, 2), (11, 6, 6))  # planes 6-10
+    c = a.copy()
+    assert contacts_for([a, b, c], 2.99, 1.5, focus=0).sum() == 0
+    got = contacts_for([a, b, c], 3.0, 1.5, focus=0)
+    assert got.sum() == 16 and got[4].sum() == 16
+
+
+def test_focus_channel_out_of_range_rejected():
+    a, b, c = sandwich()
+    with pytest.raises(ValueError):
+        contacts_for([a, b, c], 1.0, focus=3)
 
 
 # ------------------------------------------------- contact intensity

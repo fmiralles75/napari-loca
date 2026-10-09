@@ -1,7 +1,7 @@
 # LocA: Colocalization & Organelle Contact Analysis for napari
 
 [![License Mozilla Public License 2.0](https://img.shields.io/badge/license-MPL--2.0-green)](https://github.com/fmiralles75/napari-loca/raw/main/LICENSE)
-[![tests](https://github.com/fmiralles75/napari-loca/workflows/tests/badge.svg)](https://github.com/fmiralles75/napari-loca/actions)
+[![tests](https://github.com/fmiralles75/napari-loca/actions/workflows/test_and_deploy.yml/badge.svg)](https://github.com/fmiralles75/napari-loca/actions/workflows/test_and_deploy.yml)
 
 **LocA** (Colocalization Analysis) is a [napari] plugin that measures how
 organelles overlap, touch and are shaped in multichannel fluorescence images,
@@ -82,16 +82,24 @@ LIF readers are GPL-licensed and therefore optional:
   Use ROIs, and check the thresholded layers.
 - Skeleton metrics (branches, junctions) depend on the segmentation; inspect
   the Skeleton and Junction layers before trusting them.
-- With 3–4 channels, Contact Area requires all but one channel to overlap
-  exactly; three organelles close together without overlapping are not
-  counted.
+- With 3–4 channels, the default *Overlap-based* contacts method requires all
+  but one channel to overlap exactly, so three organelles close together
+  without overlapping are not counted. Choose *Focus channel* instead to
+  count a chosen channel's signal lying within the contact distance of every
+  other channel (see Metric Descriptions in the plugin).
 - Contact distances, lengths and Feret diameters are reported in XY pixels
   (multiply by the pixel size for µm).
 
 ## Citing
 
-If you use LocA, please cite this repository. <!-- TODO: add the Zenodo
-DOI once v0.1.0 is released. -->
+If you use LocA, please cite it. Citation details are in
+[CITATION.cff](CITATION.cff), and GitHub's **Cite this repository** button
+gives them in APA and BibTeX. <!-- TODO: add the Zenodo DOI badge and the
+DOI here once v0.1.0 is archived. -->
+
+## Changes
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing and issues
 

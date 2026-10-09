@@ -138,6 +138,110 @@ def test_raw_intensity_mode_in_widget(widget):
 
 
 # ---------------------------------------------------------------------
+# Contacts method (3-4 channels): Overlap-based vs Focus channel
+# ---------------------------------------------------------------------
+def _add_third_channel(widget):
+    """Third channel = the mito phantom shifted 3 px in X, so it sits
+    near (not on) the other two. On this phantom the two methods then
+    give different, non-zero Contact Areas (verified: Overlap-based 231,
+    Focus = Golgi 204, triple intersection 26 voxels)."""
+    data = np.load(PHANTOM)
+    third = np.roll(data["mito"], 3, axis=-1)
+    widget.viewer.add_image(third, name="Mito shifted", scale=SCALE)
+    widget.channel_mode_combo.setCurrentText("3")
+    widget.per_channel_mode[2].setCurrentText("Manual")
+    widget.per_channel_manual[2].setValue(0.30)
+
+
+def _expected_contacts(widget, focus):
+    r, _, _ = widget._get_z_xy_ratio()
+    dists = [W.contact_distance_map(m, r) for m in widget.last_masks]
+    return W.compute_contacts(
+        widget.last_masks, dists, widget.threshold, focus=focus
+    )
+
+
+def test_contact_method_controls_follow_channel_count(widget):
+    """Grayed out with 2 channels (one definition only); the focus list
+    only matters, and is only enabled, in Focus channel mode."""
+    m, f = widget.contact_method_combo, widget.contact_focus_combo
+    assert m.currentText() == W.CONTACT_METHOD_OVERLAP  # default
+    assert not m.isEnabled() and not f.isEnabled()
+    _add_third_channel(widget)
+    assert m.isEnabled() and not f.isEnabled()
+    assert [f.itemText(i) for i in range(f.count())] == [
+        "Golgi",
+        "Mito",
+        "Mito shifted",
+    ]
+    m.setCurrentText(W.CONTACT_METHOD_FOCUS)
+    assert f.isEnabled()
+    widget.channel_mode_combo.setCurrentText("2")
+    assert not m.isEnabled() and not f.isEnabled()
+    assert f.count() == 2
+
+
+def test_focus_channel_method_in_widget(widget):
+    """Analyze with 3 channels runs the selected definition, records it
+    in a Contact Method column, and the focus-mode contacts lie on the
+    focus channel."""
+    _add_third_channel(widget)
+    widget.analyze_contacts()
+    overlap = widget.last_metrics
+    assert overlap["Contact Method"] == W.CONTACT_METHOD_OVERLAP
+    exp = _expected_contacts(widget, None)
+    assert overlap["Contact Area"] == int(exp.sum()) > 0
+
+    widget.contact_method_combo.setCurrentText(W.CONTACT_METHOD_FOCUS)
+    widget.contact_focus_combo.setCurrentIndex(0)  # Golgi
+    widget.analyze_contacts()
+    focus = widget.last_metrics
+    assert focus["Contact Method"] == "Focus channel (Golgi)"
+    exp = _expected_contacts(widget, 0)
+    assert focus["Contact Area"] == int(exp.sum()) > 0
+    assert not (exp & ~widget.last_masks[0]).any()
+    assert focus["Contact Area"] != overlap["Contact Area"]
+    # Everything else is unaffected by the contact definition.
+    for k in ("Intersection", "Union", "Signal Area (Golgi)"):
+        assert focus[k] == overlap[k], k
+
+    # The Contacts layer shows the same region that was measured.
+    shown = np.asarray(widget._last_contacts_display) > 0
+    assert int(shown.sum()) == focus["Contact Area"]
+
+
+def test_two_channel_rows_have_no_contact_method_column(widget):
+    """With 2 channels the method is irrelevant; leaving the column out
+    keeps 2-channel exports exactly as before (see the golden test)."""
+    widget.contact_method_combo.setCurrentText(W.CONTACT_METHOD_FOCUS)
+    widget.analyze_contacts()
+    assert "Contact Method" not in widget.last_metrics
+
+
+def test_contact_method_is_saved_in_settings(widget):
+    _add_third_channel(widget)
+    widget.contact_method_combo.setCurrentText(W.CONTACT_METHOD_FOCUS)
+    widget.contact_focus_combo.setCurrentIndex(2)
+    snap = widget._settings_snapshot()
+    assert snap["contact_method_index"] == 1
+    assert snap["contact_focus_index"] == 2
+
+
+def test_focus_choice_survives_dropping_a_channel(widget):
+    """Focus = channel 3, switch to 2 channels and back: the focus must
+    return to channel 3, not silently become channel 2."""
+    _add_third_channel(widget)
+    widget.contact_method_combo.setCurrentText(W.CONTACT_METHOD_FOCUS)
+    widget.contact_focus_combo.setCurrentIndex(2)
+    widget.channel_mode_combo.setCurrentText("2")
+    assert widget._contact_focus_index(2) is None  # 2 channels: unused
+    widget.channel_mode_combo.setCurrentText("3")
+    assert widget.contact_focus_combo.currentIndex() == 2
+    assert widget._contact_focus_index(3) == 2
+    assert widget._settings_snapshot()["contact_focus_index"] == 2
+
+
+# ---------------------------------------------------------------------
 # Input controls: mouse wheel needs focus; spinboxes show full values
 # ---------------------------------------------------------------------
 def _send_wheel(w, notches=1):
