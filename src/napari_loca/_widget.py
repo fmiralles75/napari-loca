@@ -13,8 +13,10 @@ explicit version constraints in ``pyproject.toml``
 the upstream issues each constraint works around.
 """
 
+import contextlib
 import copy
 import json
+import os
 import re
 import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -368,6 +370,98 @@ def compute_contact_sites(
         cents[:, 0] *= float(z_xy_ratio)
     d, _ = cKDTree(cents).query(cents, k=2)
     return int(n), mean_size, float(np.mean(d[:, 1]))
+
+
+# Morphology Network: holes up to this many pixels, enclosed within one
+# XY plane by a single body, are filled before skeletonizing (see
+# fill_holes_per_body). 16 px is a hole about 4 px (~0.4 um at 0.1 um/px)
+# across -- smaller than a resolvable lumen or ring.
+SKELETON_HOLE_MAX_PX = 16
+
+
+def _small_plane_holes(plane: np.ndarray, max_px: int) -> np.ndarray:
+    """Background pieces of a 2D mask (face connectivity) that do not
+    touch the image edge and have at most ``max_px`` pixels."""
+    bg, n = ndi_label(~plane)
+    if n == 0:
+        return np.zeros_like(plane, dtype=bool)
+    sizes = np.bincount(bg.ravel())
+    small = sizes <= max_px
+    small[0] = False
+    edge = np.concatenate([bg[0], bg[-1], bg[:, 0], bg[:, -1]])
+    small[edge] = False
+    return small[bg]
+
+
+def fill_holes_per_body(
+    labels: np.ndarray, max_plane_px: int = SKELETON_HOLE_MAX_PX
+) -> np.ndarray:
+    """Fill holes enclosed by a single body, returning new body labels.
+
+    Fills (a) in 3D, every cavity -- background fully enclosed by mask,
+    any size; and (b) holes of up to ``max_plane_px`` pixels enclosed
+    within one XY plane (in 3D these are tunnels through a body only a
+    few planes thick). A hole is filled only if every mask voxel touching
+    it (face connectivity, including the planes above and below) belongs
+    to one body, and it takes that body's label -- so no two bodies are
+    ever joined and the body count is unchanged.
+
+    Why: skeletonization preserves topology, so it must keep a loop
+    around every hole and a closed shell around every cavity. Dim voxels
+    left inside a mitochondrion by thresholding therefore turn its
+    skeleton into rings, ladders and dot grids full of junctions that
+    are not branch points. Measured on a real U2OS mito cell (threshold
+    0.1): junction pixels -61%, junctions -31%, skeleton -19%, mask
+    +1.9%, bodies unchanged."""
+    binary = labels > 0
+    if not binary.any():
+        return labels
+    if labels.ndim == 3:
+        # Enclosed cavities: background pieces (face connectivity, as
+        # skeletonization treats background) not touching the volume's
+        # faces. Same result as binary_fill_holes, ~3x faster here.
+        bg, n_bg = ndi_label(~binary)
+        faces = np.concatenate(
+            [
+                bg[(slice(None),) * ax + (end,)].ravel()
+                for ax in range(3)
+                for end in (0, -1)
+            ]
+        )
+        enclosed = np.ones(n_bg + 1, dtype=bool)
+        enclosed[0] = False
+        enclosed[faces] = False
+        cand = enclosed[bg]
+        filled = binary | cand
+        for z in range(labels.shape[0]):
+            cand[z] |= _small_plane_holes(filled[z], max_plane_px)
+    else:
+        cand = _small_plane_holes(binary, max_plane_px)
+    if not cand.any():
+        return labels
+    holes, n_holes = ndi_label(cand)
+    # Which body labels touch each hole (face neighbours only).
+    lo = np.full(n_holes + 1, np.iinfo(np.int64).max, dtype=np.int64)
+    hi = np.zeros(n_holes + 1, dtype=np.int64)
+    for ax in range(labels.ndim):
+        for step in (1, -1):
+            src = [slice(None)] * labels.ndim
+            dst = [slice(None)] * labels.ndim
+            if step == 1:
+                src[ax], dst[ax] = slice(0, -1), slice(1, None)
+            else:
+                src[ax], dst[ax] = slice(1, None), slice(0, -1)
+            h = holes[tuple(src)]
+            lab = labels[tuple(dst)]
+            hit = (h > 0) & (lab > 0)
+            np.minimum.at(lo, h[hit], lab[hit])
+            np.maximum.at(hi, h[hit], lab[hit])
+    one_body = (hi > 0) & (lo == hi)
+    one_body[0] = False
+    out = labels.copy()
+    fill = one_body[holes]
+    out[fill] = hi[holes[fill]]
+    return out
 
 
 def body_aspect_ratio(coords: np.ndarray, spacing) -> Optional[float]:
@@ -750,6 +844,44 @@ def contact_distance_map(mask: np.ndarray, z_xy_ratio: float) -> np.ndarray:
     return distance_transform_edt(~mask, sampling=sampling)
 
 
+# Junction points layer ("Junction Ch N"): one 1-pixel blue dot per
+# junction, faint enough not to hide the skeleton underneath.
+JUNCTION_POINT_SIZE = 1
+JUNCTION_POINT_OPACITY = 0.3
+
+# Export dialogs remember the last folder used, separately for Excel
+# files (Export to Excel, Append to Spreadsheet) and GraphPad Prism
+# workbooks (Export/Append for Prism). Stored with the other settings.
+EXPORT_KIND_EXCEL = "excel"
+EXPORT_KIND_PRISM = "prism"
+
+
+def _export_start_path(owner, kind: str, default_name: str = "") -> str:
+    """Starting path for a file dialog: the last folder used for this
+    kind of export (joined with ``default_name`` if given), or just
+    ``default_name`` when there is none or it no longer exists (e.g. an
+    external drive that was unplugged)."""
+    folder = (getattr(owner, "_last_export_dirs", None) or {}).get(kind, "")
+    if folder and os.path.isdir(folder):
+        return os.path.join(folder, default_name) if default_name else folder
+    return default_name
+
+
+def _remember_export_dir(owner, kind: str, file_path: str) -> None:
+    """Remember the folder of ``file_path`` for the next ``kind`` dialog
+    and persist it with the widget settings."""
+    if not file_path:
+        return
+    dirs = getattr(owner, "_last_export_dirs", None)
+    if dirs is None:
+        dirs = {}
+        owner._last_export_dirs = dirs
+    dirs[kind] = os.path.dirname(os.path.abspath(file_path))
+    save = getattr(owner, "_save_settings", None)
+    if callable(save):
+        save()
+
+
 # How contacts are defined when 3-4 channels are analyzed (see
 # compute_contacts and the "Contact Area" glossary entry). With 2 channels
 # both reduce to the same symmetric definition, so the choice only
@@ -954,6 +1086,19 @@ the branch's pixel centers (1 per straight step, &radic;2 per diagonal,
 Z steps weighted by the Z/XY calibration) plus one pixel for the end caps,
 in XY pixels &mdash; multiply by the pixel size for &micro;m. It does not
 depend on which way a branch is oriented.</p>
+<p><b>Fill small holes before skeletonizing</b> (Morphology section, on
+by default) &mdash; skeletonization keeps a loop around every hole in a
+body and a closed shell around every enclosed cavity, so dim voxels left
+inside a mitochondrion by thresholding turn its skeleton into rings,
+ladders and dot grids full of junctions that are not branch points. With
+this on, each body's own holes are filled first: every enclosed 3D
+cavity, and holes of up to 16 pixels (about 4 px across) enclosed within
+one plane. A hole is filled only when it is surrounded by a single body,
+so separate bodies are never joined. Only the skeleton uses the filled
+mask (Branch/Junction Count, Branch Length, the Skeleton and Junction
+layers); Signal Area, Body Count, Fragmentation and contact metrics use
+the mask as thresholded. Keep the setting identical across every
+condition you compare.</p>
 <p><b>Merge junctions within</b> (Morphology section, off by default)
 &mdash; junctions whose centers lie within this many XY pixels (Z scaled
 by the voxel ratio) are counted as one, and the short skeleton segments
@@ -1620,6 +1765,8 @@ class OrganelleContactWidget(QWidget):
         self.threshold = 0.0
         self._last_z_source_signature = None
         self.metrics_list: List[Dict[str, Any]] = []
+        # Last folder per export kind (see _export_start_path).
+        self._last_export_dirs: Dict[str, str] = {}
         self.last_metrics: Any = {}
         self.last_masks: List[np.ndarray] = []
         self.current_roi_index = 0
@@ -2138,6 +2285,11 @@ class OrganelleContactWidget(QWidget):
         )
 
         self.roi_button = QPushButton("Toggle ROI Selection")
+        self.roi_button.setToolTip(
+            "Select the ROI layer with the Polygon Lasso tool, ready to "
+            "trace cells (the layer is created the first time). Click "
+            "again to switch between drawing and pan/zoom."
+        )
         self.roi_button.clicked.connect(self.toggle_roi_selection)
 
         self.show_thresh_btns: List[QPushButton] = []
@@ -2223,6 +2375,26 @@ class OrganelleContactWidget(QWidget):
             "the same across every condition you compare."
         )
         self.junction_merge_spinbox.valueChanged.connect(
+            lambda _: self._save_settings()
+        )
+
+        self.fill_skeleton_holes_checkbox = QCheckBox(
+            "Fill small holes before skeletonizing"
+        )
+        self.fill_skeleton_holes_checkbox.setToolTip(
+            "Before skeletonizing, fill each body's own enclosed holes: "
+            "3D cavities, and holes up to "
+            f"{SKELETON_HOLE_MAX_PX} px within one plane. Dim voxels "
+            "left inside a mitochondrion by thresholding otherwise force "
+            "the skeleton into rings and grids full of junctions that "
+            "are not branch points. Only the skeleton (Morphology "
+            "Network, Skeleton/Junction layers) uses the filled mask; "
+            "areas, Body Count and contact metrics do not. Holes between "
+            "two bodies are never filled, so bodies are not joined. "
+            "Keep it the same across every condition you compare."
+        )
+        self.fill_skeleton_holes_checkbox.setChecked(True)
+        self.fill_skeleton_holes_checkbox.stateChanged.connect(
             lambda _: self._save_settings()
         )
 
@@ -2385,6 +2557,7 @@ class OrganelleContactWidget(QWidget):
         junction_merge_layout.addWidget(QLabel("Merge junctions within:"))
         junction_merge_layout.addWidget(self.junction_merge_spinbox)
         morph_group_layout.addLayout(junction_merge_layout)
+        morph_group_layout.addWidget(self.fill_skeleton_holes_checkbox)
         skel_btn_layout = QGridLayout()
         for i in range(self.max_channels_supported):
             skel_btn_layout.addWidget(self.show_skeleton_btns[i], i, 0)
@@ -2581,6 +2754,9 @@ class OrganelleContactWidget(QWidget):
             "display_layers_selection": self.display_layers_selection,
             "min_body_size": self.min_body_size_spinbox.value(),
             "junction_merge_px": self.junction_merge_spinbox.value(),
+            "fill_skeleton_holes": (
+                self.fill_skeleton_holes_checkbox.isChecked()
+            ),
             "filter_body_metrics": (
                 self.filter_body_metrics_checkbox.isChecked()
             ),
@@ -2601,6 +2777,7 @@ class OrganelleContactWidget(QWidget):
             "saved_scale_bar_unit": self.saved_scale_bar_unit,
             "saved_scale_bar_text_size": self.saved_scale_bar_text_size,
             "metric_display_keys": self._metric_display_keys,
+            "last_export_dirs": dict(self._last_export_dirs),
         }
 
     def _save_settings(self):
@@ -2664,6 +2841,13 @@ class OrganelleContactWidget(QWidget):
                     self.saved_scale_bar_text_size,
                 )
             )
+            dirs = data.get("last_export_dirs")
+            if isinstance(dirs, dict):
+                self._last_export_dirs = {
+                    str(k): str(v)
+                    for k, v in dirs.items()
+                    if isinstance(v, str) and v
+                }
             mdk = data.get("metric_display_keys", None)
             self._metric_display_keys = (
                 list(mdk) if isinstance(mdk, list) else None
@@ -2778,6 +2962,9 @@ class OrganelleContactWidget(QWidget):
                 )
             self.filter_body_metrics_checkbox.setChecked(
                 bool(data.get("filter_body_metrics", True))
+            )
+            self.fill_skeleton_holes_checkbox.setChecked(
+                bool(data.get("fill_skeleton_holes", True))
             )
             self.filter_threshold_mask_checkbox.setChecked(
                 bool(data.get("filter_threshold_mask", False))
@@ -3974,6 +4161,17 @@ class OrganelleContactWidget(QWidget):
             signal_area = int(np.sum(mask))
         return labels, int(n_bodies), int(signal_area), binary
 
+    def _skeleton_labels(self, labels: np.ndarray) -> np.ndarray:
+        """Body labels to skeletonize: with "Fill small holes before
+        skeletonizing" on (default), each body's own small holes and
+        cavities are filled first (fill_holes_per_body). Only the
+        skeleton uses this; areas, Body Count and every other metric
+        keep the unfilled mask."""
+        cb = getattr(self, "fill_skeleton_holes_checkbox", None)
+        if cb is None or cb.isChecked():
+            return fill_holes_per_body(labels)
+        return labels
+
     @staticmethod
     def _skeleton_and_junctions(
         binary_mask: np.ndarray,
@@ -4400,8 +4598,8 @@ class OrganelleContactWidget(QWidget):
                 else 1.0
             )
             for i in range(n):
-                labels_i, n_bodies_i, _, binary_i = (
-                    self._labeled_bodies_for_metrics(masks[i])
+                labels_i, n_bodies_i, _, _ = self._labeled_bodies_for_metrics(
+                    masks[i]
                 )
                 branch_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
                 junction_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
@@ -4410,8 +4608,11 @@ class OrganelleContactWidget(QWidget):
 
                 if n_bodies_i > 0:
                     try:
+                        # Filled holes belong to their body, for the
+                        # skeleton only; body areas below stay unfilled.
+                        skel_labels_i = self._skeleton_labels(labels_i)
                         skel, junction_mask = self._skeleton_and_junctions(
-                            binary_i
+                            skel_labels_i > 0
                         )
                         # Junction clusters (touching junction pixels =
                         # one junction), optionally merged by distance
@@ -4422,14 +4623,14 @@ class OrganelleContactWidget(QWidget):
                             junction_mask,
                             merge_px=junction_merge_px,
                             z_ratio=junction_z_ratio,
-                            body_labels=labels_i,
+                            body_labels=skel_labels_i,
                         )
                         branch_labels = jg["branch_labels"]
                         n_frags = jg["n_branches"]
                         if n_frags > 0:
                             frag_ids = np.arange(1, n_frags + 1)
                             frag_body = ndi_maximum(
-                                labels_i,
+                                skel_labels_i,
                                 labels=branch_labels,
                                 index=frag_ids,
                             )
@@ -4856,11 +5057,12 @@ class OrganelleContactWidget(QWidget):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export to Excel",
-            "Excel Export.xlsx",
+            _export_start_path(self, EXPORT_KIND_EXCEL, "Excel Export.xlsx"),
             "Excel Files (*.xlsx);;CSV Files (*.csv);;All Files (*)",
         )
         if not file_path:
             return
+        _remember_export_dir(self, EXPORT_KIND_EXCEL, file_path)
         if not file_path.lower().endswith((".xlsx", ".csv")):
             file_path = file_path + ".xlsx"
 
@@ -4891,11 +5093,14 @@ class OrganelleContactWidget(QWidget):
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "Export for GraphPad Prism",
-            "GraphPad Prism Export.xlsx",
+            _export_start_path(
+                self, EXPORT_KIND_PRISM, "GraphPad Prism Export.xlsx"
+            ),
             "Excel Files (*.xlsx);;CSV Files (*.csv);;All Files (*)",
         )
         if not file_path:
             return
+        _remember_export_dir(self, EXPORT_KIND_PRISM, file_path)
         if not file_path.lower().endswith((".xlsx", ".csv")):
             file_path = file_path + ".xlsx"
 
@@ -4979,11 +5184,12 @@ class OrganelleContactWidget(QWidget):
         in_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Excel File to Append",
-            "",
+            _export_start_path(self, EXPORT_KIND_EXCEL),
             "CSV Files (*.csv);;Excel Files (*.xlsx);;All Files (*)",
         )
         if not in_path:
             return
+        _remember_export_dir(self, EXPORT_KIND_EXCEL, in_path)
 
         rows = self._collect_export_rows()
         if not rows:
@@ -5025,11 +5231,12 @@ class OrganelleContactWidget(QWidget):
         in_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select GraphPad Workbook to Append",
-            "",
+            _export_start_path(self, EXPORT_KIND_PRISM),
             "Excel Files (*.xlsx);;All Files (*)",
         )
         if not in_path:
             return
+        _remember_export_dir(self, EXPORT_KIND_PRISM, in_path)
 
         rows = self._collect_export_rows()
         if not rows:
@@ -5257,15 +5464,18 @@ class OrganelleContactWidget(QWidget):
             print(f"Channel {ch_index+1} is not active for current analysis.")
             return
 
-        body_labels_disp, n_bodies, _, binary = (
-            self._labeled_bodies_for_metrics(self.last_masks[ch_index])
+        body_labels_disp, n_bodies, _, _ = self._labeled_bodies_for_metrics(
+            self.last_masks[ch_index]
         )
         if n_bodies == 0:
             print(f"No bodies to skeletonize for channel {ch_index + 1}.")
             return
 
         try:
-            skel, junction_mask = self._skeleton_and_junctions(binary)
+            body_labels_disp = self._skeleton_labels(body_labels_disp)
+            skel, junction_mask = self._skeleton_and_junctions(
+                body_labels_disp > 0
+            )
         except Exception as e:
             print(f"Warning: skeletonization failed: {e}")
             return
@@ -5339,29 +5549,34 @@ class OrganelleContactWidget(QWidget):
                     f"branch(es) no longer counted."
                 )
 
-            if junction_coords.size and layer_scale is not None:
-                scale_arr = np.asarray(layer_scale)
-                if scale_arr.shape[0] == junction_coords.shape[1]:
-                    junction_coords_world = junction_coords * scale_arr
-                    if layer_translate is not None:
-                        junction_coords_world = (
-                            junction_coords_world + np.asarray(layer_translate)
-                        )
-                else:
-                    junction_coords_world = junction_coords
-            else:
-                junction_coords_world = junction_coords
-
+            # Points kept in pixel coordinates on a layer with the image's
+            # own scale/translate (like the Skeleton layer), so size=1 is
+            # exactly one pixel. They used to be converted to world units
+            # on an unscaled layer, where the marker size was in world
+            # units too and drew far larger than a pixel.
+            point_kwargs = {}
+            if (
+                layer_scale is not None
+                and len(np.atleast_1d(layer_scale)) == junction_coords.shape[1]
+            ):
+                point_kwargs["scale"] = layer_scale
+                if layer_translate is not None:
+                    point_kwargs["translate"] = layer_translate
             if junction_name in self.viewer.layers:
                 lyr = self.viewer.layers[junction_name]
-                lyr.data = junction_coords_world
+                lyr.data = junction_coords
+                for k, v in point_kwargs.items():
+                    setattr(lyr, k, v)
+                lyr.size = JUNCTION_POINT_SIZE
             else:
                 self.viewer.add_points(
-                    junction_coords_world,
+                    junction_coords,
                     name=junction_name,
                     face_color="blue",
-                    size=6,
-                    opacity=0.9,
+                    size=JUNCTION_POINT_SIZE,
+                    opacity=JUNCTION_POINT_OPACITY,
+                    blending="translucent_no_depth",
+                    **point_kwargs,
                 )
             junction_count_shown = int(junction_coords.shape[0])
 
@@ -5373,6 +5588,21 @@ class OrganelleContactWidget(QWidget):
         print(f"Displayed {' and '.join(shown)} for channel {ch_index + 1}.")
 
     # ---------------- ROI layer ----------------
+    def _activate_layer(self, layer) -> None:
+        """Make ``layer`` the selected layer, so the mouse draws on it."""
+        with contextlib.suppress(Exception):
+            self.viewer.layers.selection.active = layer
+
+    def _set_roi_draw_mode(self, roi_layer) -> None:
+        """Select the ROI layer and its Polygon Lasso tool (click-drag to
+        trace a freehand outline). Falls back to the click-per-vertex
+        polygon tool on a napari without the lasso."""
+        self._activate_layer(roi_layer)
+        try:
+            roi_layer.mode = "add_polygon_lasso"
+        except (ValueError, KeyError):
+            roi_layer.mode = "add_polygon"
+
     def toggle_roi_selection(self):
         roi_layer = None
         for layer in self.viewer.layers:
@@ -5429,24 +5659,24 @@ class OrganelleContactWidget(QWidget):
                 translate=base_translate,
             )
             roi_layer.data = []
-            roi_layer.mode = "select"
+            self._set_roi_draw_mode(roi_layer)
             print(
-                "ROI layer created (2D, visible on every slice)."
-                " Use the layer controls to add ROI(s).",
+                "ROI layer created (2D, visible on every slice). "
+                "Polygon lasso selected: draw ROI(s) on the image."
             )
         else:
-            if len(list(roi_layer.data)) == 0:
-                roi_layer.mode = "select"
-                print(
-                    "No ROI drawn yet. Please draw an ROI before toggling mode."
-                )
+            # Toggle between drawing (polygon lasso) and pan/zoom. With
+            # no ROI drawn yet there is nothing to pan around for, so
+            # it always (re)selects the lasso.
+            if len(list(roi_layer.data)) and str(roi_layer.mode) != (
+                "pan_zoom"
+            ):
+                self._activate_layer(roi_layer)
+                roi_layer.mode = "pan_zoom"
+                print("ROI layer mode set to 'pan_zoom'.")
             else:
-                if roi_layer.mode == "select":
-                    roi_layer.mode = "pan_zoom"
-                    print("ROI layer mode set to 'pan_zoom'.")
-                else:
-                    roi_layer.mode = "select"
-                    print("ROI layer mode set to 'select'.")
+                self._set_roi_draw_mode(roi_layer)
+                print("ROI layer mode set to polygon lasso.")
 
         if not hasattr(roi_layer, "_patched_get_value"):
             original_get_value = roi_layer.get_value

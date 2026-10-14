@@ -242,6 +242,76 @@ def test_focus_choice_survives_dropping_a_channel(widget):
 
 
 # ---------------------------------------------------------------------
+# Junction points layer, ROI tool, remembered export folders
+# ---------------------------------------------------------------------
+def test_junction_points_are_one_faint_pixel_on_each_junction(widget):
+    """Junction Ch N: 1-pixel points, translucent_no_depth, opacity 0.3,
+    in pixel coordinates on the image's own scale -- one point per
+    junction that Junction Count counts."""
+    widget.analyze_contacts()
+    for _ in range(2):  # create, then update the existing layer
+        widget.show_skeleton_channel(
+            1, show_skeleton=False, show_junctions=True
+        )
+        lyr = widget.viewer.layers["Junctions (Mito)"]
+        assert len(lyr.data) > 0
+        assert W.JUNCTION_POINT_SIZE == 1
+        assert np.all(np.asarray(lyr.size) == 1)
+        assert str(lyr.blending) == "translucent_no_depth"
+        assert lyr.opacity == pytest.approx(0.3)
+        np.testing.assert_allclose(lyr.scale, widget._last_display_scale)
+    # Same path the plugin takes: bodies -> (default) per-body hole fill
+    # -> skeleton -> junction groups.
+    body, _, _, _ = widget._labeled_bodies_for_metrics(widget.last_masks[1])
+    body = widget._skeleton_labels(body)
+    skel, jmask = widget._skeleton_and_junctions(body > 0)
+    jg = widget._group_junctions(skel, jmask, body_labels=body)
+    np.testing.assert_allclose(lyr.data, jg["group_centroids"])
+
+
+def test_toggle_roi_selects_polygon_lasso(widget):
+    widget.toggle_roi_selection()  # creates the ROI layer
+    roi = widget.viewer.layers["ROI"]
+    layers = widget.viewer.layers
+    assert str(roi.mode) == "add_polygon_lasso"
+    assert layers.selection.active is roi
+    widget.toggle_roi_selection()  # nothing drawn yet: stays on lasso
+    assert str(roi.mode) == "add_polygon_lasso"
+    rect = np.array([[10, 5], [10, 85], [30, 85], [30, 5]], float)
+    roi.add([rect], shape_type="polygon")
+    widget.toggle_roi_selection()
+    assert str(roi.mode) == "pan_zoom"
+    layers.selection.active = layers["Golgi"]
+    widget.toggle_roi_selection()  # back to drawing, on the ROI layer
+    assert str(roi.mode) == "add_polygon_lasso"
+    assert layers.selection.active is roi
+
+
+def test_fill_skeleton_holes_is_on_by_default_and_saved(widget):
+    cb = widget.fill_skeleton_holes_checkbox
+    assert cb.isChecked()
+    assert widget._settings_snapshot()["fill_skeleton_holes"] is True
+    cb.setChecked(False)
+    assert widget._settings_snapshot()["fill_skeleton_holes"] is False
+    labels = np.zeros((1, 8, 8), int)
+    labels[0, 1:7, 1:7] = 1
+    labels[0, 3, 3] = 0  # a 1-px hole: left alone when the box is off
+    assert np.array_equal(widget._skeleton_labels(labels), labels)
+    cb.setChecked(True)
+    assert widget._skeleton_labels(labels)[0, 3, 3] == 1
+
+
+def test_export_folders_are_saved_in_settings(widget, tmp_path):
+    widget._last_export_dirs = {
+        W.EXPORT_KIND_EXCEL: str(tmp_path),
+        W.EXPORT_KIND_PRISM: str(tmp_path / "p"),
+    }
+    snap = widget._settings_snapshot()
+    assert snap["last_export_dirs"] == widget._last_export_dirs
+    assert snap["last_export_dirs"] is not widget._last_export_dirs
+
+
+# ---------------------------------------------------------------------
 # Input controls: mouse wheel needs focus; spinboxes show full values
 # ---------------------------------------------------------------------
 def _send_wheel(w, notches=1):

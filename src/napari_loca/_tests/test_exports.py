@@ -1,6 +1,8 @@
 """Exports: what lands in Excel / CSV / the Prism workbook must be exactly
 the numbers computed in memory, under labels that identify them."""
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -9,14 +11,20 @@ from napari_loca import _widget as W
 
 
 class FakeFileDialog:
+    """Returns ``path`` as the user's choice and records the starting
+    path each dialog was opened at (Qt's 3rd argument)."""
+
     path = ""
+    starts = []
 
     @classmethod
     def getSaveFileName(cls, *a, **k):  # noqa: N802
+        cls.starts.append(a[2] if len(a) > 2 else "")
         return cls.path, ""
 
     @classmethod
     def getOpenFileName(cls, *a, **k):  # noqa: N802
+        cls.starts.append(a[2] if len(a) > 2 else "")
         return cls.path, ""
 
 
@@ -35,6 +43,7 @@ class FakeMessageBox:
 @pytest.fixture
 def dialogs(monkeypatch):
     FakeMessageBox.messages = []
+    FakeFileDialog.starts = []
     monkeypatch.setattr(W, "QFileDialog", FakeFileDialog)
     monkeypatch.setattr(W, "QMessageBox", FakeMessageBox)
     return FakeFileDialog
@@ -268,6 +277,56 @@ def test_append_to_prism_workbook(make_harness, dialogs, tmp_path):
     book = pd.read_excel(path, sheet_name=None)
     assert len(book["All_Metrics"]) == 3
     assert book["Intersection"]["KO"].dropna().tolist() == [7]
+
+
+# ------------------------------------------- remembered export folders
+def test_export_dialogs_remember_last_folder_per_kind(
+    make_harness, dialogs, tmp_path
+):
+    """Excel (export + append) and Prism (export + append) each reopen
+    in the folder last used for that kind of file."""
+    xl, pr = tmp_path / "excel", tmp_path / "prism"
+    xl.mkdir()
+    pr.mkdir()
+    h = make_harness(metrics_list=sample_rows())
+    dialogs.path = str(xl / "a.csv")
+    h.save_metrics()
+    dialogs.path = str(pr / "b.xlsx")
+    h.export_graphpad_prism()
+    dialogs.path = str(xl / "c.csv")
+    h.save_metrics()
+    dialogs.path = str(pr / "b.xlsx")
+    h.append_to_graphpad_prism()
+    dialogs.path = str(xl / "a.csv")
+    h.append_to_spreadsheet()
+    assert dialogs.starts == [
+        "Excel Export.xlsx",  # nothing remembered yet
+        "GraphPad Prism Export.xlsx",
+        os.path.join(str(xl), "Excel Export.xlsx"),
+        str(pr),
+        str(xl),
+    ]
+    assert h._last_export_dirs == {
+        W.EXPORT_KIND_EXCEL: str(xl),
+        W.EXPORT_KIND_PRISM: str(pr),
+    }
+    assert len(pd.read_csv(xl / "a.csv")) == 6  # the append really ran
+
+
+def test_export_dialog_ignores_missing_folder_and_cancel(
+    make_harness, dialogs, tmp_path
+):
+    """A remembered folder that no longer exists (unplugged drive) falls
+    back to the plain default name; cancelling remembers nothing."""
+    gone = str(tmp_path / "unplugged")
+    h = make_harness(
+        metrics_list=sample_rows(),
+        _last_export_dirs={W.EXPORT_KIND_EXCEL: gone},
+    )
+    dialogs.path = ""  # user cancels
+    h.save_metrics()
+    assert dialogs.starts == ["Excel Export.xlsx"]
+    assert h._last_export_dirs == {W.EXPORT_KIND_EXCEL: gone}
 
 
 # ---------------------------------------------------- add_analysis

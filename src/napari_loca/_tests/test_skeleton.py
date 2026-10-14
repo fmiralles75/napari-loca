@@ -357,3 +357,104 @@ def test_merge_through_metrics_bundle(make_harness):
     assert out(0)["Branch Count Mean (A)"] == 5
     assert out(4)["Junction Count Mean (A)"] == 1
     assert out(4)["Branch Count Mean (A)"] == 4
+
+
+# ------------------------------------- holes filled before skeletonizing
+FILL = W.fill_holes_per_body
+
+
+def _lab(mask):
+    from scipy.ndimage import label
+
+    return label(mask)[0]
+
+
+def test_fill_closes_small_hole_inside_one_body_2d():
+    m = np.zeros((20, 20), bool)
+    m[4:12, 4:12] = True
+    m[7:9, 7:9] = False  # 4-px hole
+    out = FILL(_lab(m))
+    assert (out[4:12, 4:12] == 1).all()  # hole filled with the body label
+
+
+def test_fill_respects_plane_hole_size_limit():
+    """A hole bigger than SKELETON_HOLE_MAX_PX (a real ring/lumen) stays."""
+    m = np.zeros((30, 30), bool)
+    m[3:20, 3:20] = True
+    m[8:13, 8:12] = False  # 20 px > 16
+    out = FILL(_lab(m))
+    assert not out[8:13, 8:12].any()
+    m[8:13, 8:12] = True
+    m[8:12, 8:12] = False  # exactly 16 px
+    assert (FILL(_lab(m))[8:12, 8:12] == 1).all()
+
+
+def test_fill_never_joins_two_bodies():
+    """Two L-shaped bodies that meet only at their corners (diagonally,
+    so they are separate bodies) and together enclose a 9-px gap: the
+    gap stays open and both keep their own labels."""
+    m = np.zeros((10, 10), bool)
+    m[2, 2:6] = True  # body 1: top row ...
+    m[2:6, 2] = True  # ... and left column
+    m[6, 3:7] = True  # body 2: bottom row ...
+    m[3:7, 6] = True  # ... and right column
+    lab = _lab(m)
+    assert lab.max() == 2
+    assert not m[3:6, 3:6].any()  # the enclosed 3x3 gap
+    assert np.array_equal(FILL(lab), lab)
+
+
+def test_fill_3d_cavity_any_size_and_tunnel():
+    """3D: an enclosed cavity is filled whatever its size; a 2x2 tunnel
+    through a 3-plane-thick body is filled (a hole in every plane)."""
+    m = np.zeros((9, 30, 30), bool)
+    m[1:8, 2:14, 2:14] = True
+    m[2:7, 4:12, 4:12] = False  # 320-voxel enclosed cavity
+    m[3:6, 18:26, 18:26] = True
+    m[3:6, 21:23, 21:23] = False  # tunnel through all 3 planes
+    lab = _lab(m)
+    out = FILL(lab)
+    assert (out[2:7, 4:12, 4:12] == lab[1, 2, 2]).all()
+    assert (out[3:6, 21:23, 21:23] == lab[4, 18, 18]).all()
+    assert out.max() == lab.max() == 2  # bodies unchanged
+
+
+def test_fill_hole_touching_another_body_in_z_is_left_open():
+    """A plane hole in body 1 with body 2 directly above it: filling it
+    would join the two through Z, so it stays open."""
+    m = np.zeros((5, 12, 12), bool)
+    m[2, 2:10, 2:10] = True
+    m[2, 5:7, 5:7] = False  # hole in plane 2 (body 1)
+    m[3, 5:7, 5:7] = True  # body 2 sits on the hole (face contact in Z)
+    lab = _lab(m)
+    assert lab.max() == 2
+    assert np.array_equal(FILL(lab), lab)
+
+
+def test_speckled_tube_skeleton_recovers_true_topology(make_harness):
+    """The 'maze': a thick 3D T with 2% dark voxels inside. Unfilled, the
+    skeleton is a shell of junction pixels; with the default fill the T
+    comes back (1 junction, 3 branches) -- and Signal Area is the same
+    either way, because only the skeleton uses the filled mask."""
+    rng = np.random.default_rng(0)
+    zz, yy, xx = np.mgrid[0:11, 0:60, 0:60]
+    tube = ((zz - 5) ** 2 + (yy - 20) ** 2 <= 16) & (xx >= 5) & (xx < 55)
+    tube |= ((zz - 5) ** 2 + (xx - 30) ** 2 <= 16) & (yy >= 20) & (yy < 55)
+    m = tube & ~(rng.random(tube.shape) < 0.02)
+
+    def run(fill):
+        return make_harness(fill_skeleton_holes=fill)._compute_metrics_bundle(
+            raw_signals=[m * 1.0],
+            masks=[m],
+            contacts=np.zeros_like(m),
+            ch_labels=["A"],
+            roi_poly_data=None,
+            roi_area=m.size,
+        )
+
+    off, on = run(False), run(True)
+    assert on["Junction Count Mean (A)"] == 1
+    assert on["Branch Count Mean (A)"] == 3
+    assert off["Branch Count Mean (A)"] != 3  # the maze is real without it
+    assert on["Signal Area (A)"] == off["Signal Area (A)"] == int(m.sum())
+    assert on["Body Count (A)"] == off["Body Count (A)"] == 1

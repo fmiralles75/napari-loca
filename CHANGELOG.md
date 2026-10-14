@@ -29,6 +29,10 @@ First public release.
 - Opt-in morphology: Aspect Ratio (in physical proportions for 3D stacks) and
   Form Factor (Crofton perimeter) per body; skeleton-based Branch Count,
   Junction Count and Euclidean Branch Length.
+- Before skeletonizing, each body's own small holes and enclosed cavities are
+  filled (on by default; Morphology section), so dim voxels inside a
+  mitochondrion no longer turn its skeleton into rings and grids of false
+  junctions. Only the skeleton uses the filled mask; bodies are never joined.
 - Cell (ROI) shape: exact Max/Min Feret diameter, Perimeter, Circularity,
   Roundness and Solidity, using the same definitions as Fiji.
 - Thresholding per channel: automatic (Otsu, Li, …), manual on a scaled

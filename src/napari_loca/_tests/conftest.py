@@ -75,6 +75,7 @@ _BORROWED = (
     "_labeled_bodies_for_metrics",
     "_filter_small_bodies",
     "_skeleton_and_junctions",
+    "_skeleton_labels",
     "_group_junctions",
     "_mean_sd_wmean",
     "_region_mask_from_mode",
@@ -109,6 +110,7 @@ def _make_harness(
     filter_body_metrics: bool = True,
     filter_threshold_mask: bool = False,
     junction_merge_px: float = 0.0,
+    fill_skeleton_holes: bool = True,
     z_step: Optional[float] = None,
     xy_pixel: Optional[float] = None,
     **extra: Any,
@@ -119,6 +121,7 @@ def _make_harness(
     h.filter_body_metrics_checkbox = FakeCheck(filter_body_metrics)
     h.filter_threshold_mask_checkbox = FakeCheck(filter_threshold_mask)
     h.junction_merge_spinbox = FakeSpin(junction_merge_px)
+    h.fill_skeleton_holes_checkbox = FakeCheck(fill_skeleton_holes)
     manual = z_step is not None and xy_pixel is not None
     h.manual_voxel_calibration_checkbox = FakeCheck(manual)
     h.z_step_spinbox = FakeSpin(z_step if manual else 1.0)
