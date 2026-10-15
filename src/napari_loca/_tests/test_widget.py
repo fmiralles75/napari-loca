@@ -471,3 +471,65 @@ def test_spinboxes_show_their_full_value(widget, qtbot):
         widget.hide()
     assert hidden == {}, f"text cut off (px hidden): {hidden}"
     assert manual_hidden <= 2
+
+
+# ---------------------------------------------------------------------
+# Finish notice (slides into the top-right corner after Analyze)
+# ---------------------------------------------------------------------
+def test_finish_notice_is_on_by_default_and_saved(widget):
+    cb = widget.notify_finish_checkbox
+    assert cb.isChecked()
+    assert widget._settings_snapshot()["notify_on_finish"] is True
+    cb.setChecked(False)
+    assert widget._settings_snapshot()["notify_on_finish"] is False
+
+
+def test_analyze_shows_notice_in_top_right_of_napari_screen(widget, qtbot):
+    from qtpy.QtGui import QGuiApplication
+
+    widget.analyze_contacts()
+    toast = widget._finish_toast
+    assert toast is not None and toast.isVisible()
+    assert "finished" in toast.title_label.text()
+    assert "Mito" in toast.body_label.text() or "Golgi" in (
+        toast.body_label.text()
+    )
+    screen = (
+        QGuiApplication.screenAt(widget.window().frameGeometry().center())
+        or QGuiApplication.primaryScreen()
+    )
+    geo = screen.availableGeometry()
+    g = toast.geometry()
+    assert geo.contains(g)  # fully on napari's screen, never beyond it
+    assert geo.right() - g.right() <= W.TOAST_MARGIN + 1  # right edge
+    assert g.top() - geo.top() <= W.TOAST_MARGIN + 1  # top edge
+    assert not toast.isActiveWindow()  # never steals focus
+    with qtbot.waitSignal(toast.destroyed, timeout=3000):
+        toast.slide_out()  # what a click or the hold timer does
+
+
+def test_no_notice_when_switched_off_or_not_started(widget, monkeypatch):
+    widget.notify_finish_checkbox.setChecked(False)
+    monkeypatch.setattr(widget, "_run_analysis", lambda: True)
+    widget.analyze_contacts()
+    assert widget._finish_toast is None
+    widget.notify_finish_checkbox.setChecked(True)
+    monkeypatch.setattr(widget, "_run_analysis", lambda: False)
+    widget.analyze_contacts()  # never started: its dialog says why
+    assert widget._finish_toast is None
+
+
+def test_failed_analysis_shows_failure_notice_and_still_raises(
+    widget, monkeypatch, qtbot
+):
+    def boom():
+        raise ValueError("no signal")
+
+    monkeypatch.setattr(widget, "_run_analysis", boom)
+    with pytest.raises(ValueError):
+        widget.analyze_contacts()
+    toast = widget._finish_toast
+    assert "failed" in toast.title_label.text()
+    assert "no signal" in toast.body_label.text()
+    with qtbot.waitSignal(toast.destroyed, timeout=3000):
+        toast.slide_out()

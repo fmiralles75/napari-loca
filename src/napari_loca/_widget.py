@@ -18,6 +18,7 @@ import copy
 import json
 import os
 import re
+import time
 import warnings
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
@@ -25,8 +26,18 @@ import imageio.v2 as imageio
 import napari
 import numpy as np
 import pandas as pd
-from qtpy.QtCore import QEvent, QRect, QSettings, QSize, Qt
-from qtpy.QtGui import QDoubleValidator
+from qtpy.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QPoint,
+    QPropertyAnimation,
+    QRect,
+    QSettings,
+    QSize,
+    Qt,
+    QTimer,
+)
+from qtpy.QtGui import QDoubleValidator, QGuiApplication
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -34,6 +45,7 @@ from qtpy.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -1834,6 +1846,115 @@ class DisplayLayersDialog(QDialog):
 # -----------------------------
 # Main Widget
 # -----------------------------
+# Finish notice: a small card that slides into the top-right corner of
+# the screen napari is on when an analysis finishes, stays a few
+# seconds, then slides back out (click it to dismiss early). It is its
+# own always-on-top window that never takes focus, so it shows while
+# you are working in another app.
+TOAST_WIDTH = 320
+TOAST_HEIGHT = 74
+TOAST_MARGIN = 14
+TOAST_SLIDE_MS = 320
+TOAST_HOLD_MS = 4500
+
+
+class FinishToast(QWidget):
+    def __init__(
+        self, parent: QWidget, title: str, body: str, ok: bool = True
+    ):
+        flags = (
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.WindowDoesNotAcceptFocus
+        )
+        super().__init__(parent, flags)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        # macOS hides tool windows while their app is in the background
+        # unless told otherwise -- the opposite of what a notice needs.
+        mac_attr = getattr(Qt, "WA_MacAlwaysShowToolWindow", None)
+        if mac_attr is not None:
+            self.setAttribute(mac_attr, True)
+        self.setFixedSize(TOAST_WIDTH, TOAST_HEIGHT)
+        self.setToolTip("Click to dismiss")
+
+        # The window stays put in the corner; the card slides inside it,
+        # so nothing ever spills onto a neighbouring monitor.
+        self.card = QFrame(self)
+        self.card.setObjectName("locaToast")
+        self.card.setGeometry(0, 0, TOAST_WIDTH, TOAST_HEIGHT)
+        accent = "#4caf50" if ok else "#e5534b"
+        self.card.setStyleSheet(
+            "#locaToast { background: #262930; border-radius: 8px; "
+            f"border-left: 5px solid {accent}; }}"
+            "QLabel { color: #f0f1f2; background: transparent; }"
+        )
+        lay = QVBoxLayout(self.card)
+        lay.setContentsMargins(16, 10, 14, 10)
+        lay.setSpacing(3)
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet("font-weight: bold;")
+        self.body_label = QLabel(body)
+        self.body_label.setWordWrap(True)
+        lay.addWidget(self.title_label)
+        lay.addWidget(self.body_label)
+        lay.addStretch(1)
+
+        self._closing = False
+        self._anim_in = QPropertyAnimation(self.card, b"pos", self)
+        self._anim_in.setDuration(TOAST_SLIDE_MS)
+        self._anim_in.setStartValue(QPoint(TOAST_WIDTH, 0))
+        self._anim_in.setEndValue(QPoint(0, 0))
+        self._anim_in.setEasingCurve(QEasingCurve.OutCubic)
+        self._anim_out = QPropertyAnimation(self.card, b"pos", self)
+        self._anim_out.setDuration(TOAST_SLIDE_MS)
+        self._anim_out.setEndValue(QPoint(TOAST_WIDTH, 0))
+        self._anim_out.setEasingCurve(QEasingCurve.InCubic)
+        self._anim_out.finished.connect(self.close)
+        self._hold = QTimer(self)
+        self._hold.setSingleShot(True)
+        self._hold.setInterval(TOAST_HOLD_MS)
+        self._hold.timeout.connect(self.slide_out)
+        self._anim_in.finished.connect(self._hold.start)
+
+    def _target_geometry(self) -> QRect:
+        """Available area (menu bar and Dock excluded) of the screen
+        that holds napari's window; the primary screen as a fallback."""
+        screen = None
+        parent = self.parentWidget()
+        if parent is not None:
+            win = parent.window()
+            screen = QGuiApplication.screenAt(win.frameGeometry().center())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        return screen.availableGeometry()
+
+    def popup(self) -> None:
+        geo = self._target_geometry()
+        self.move(
+            geo.x() + geo.width() - TOAST_WIDTH - TOAST_MARGIN,
+            geo.y() + TOAST_MARGIN,
+        )
+        self.card.move(TOAST_WIDTH, 0)
+        self.show()
+        self.raise_()
+        self._anim_in.start()
+
+    def slide_out(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        self._hold.stop()
+        self._anim_in.stop()
+        self._anim_out.setStartValue(self.card.pos())
+        self._anim_out.start()
+
+    def mousePressEvent(self, event):  # noqa: N802 (Qt naming)
+        self.slide_out()
+
+
 class OrganelleContactWidget(QWidget):
     def __init__(self, viewer: napari.Viewer):
         super().__init__()
@@ -2258,6 +2379,19 @@ class OrganelleContactWidget(QWidget):
 
         self.analyze_button = QPushButton("Analyze")
         self.analyze_button.clicked.connect(self.analyze_contacts)
+        self.notify_finish_checkbox = QCheckBox(
+            "Notify me when an analysis finishes"
+        )
+        self.notify_finish_checkbox.setToolTip(
+            "After Analyze, slide a short notice into the top-right "
+            "corner of the screen napari is on, even while you are "
+            "working in another app. Click it to dismiss."
+        )
+        self.notify_finish_checkbox.setChecked(True)
+        self.notify_finish_checkbox.stateChanged.connect(
+            lambda _: self._save_settings()
+        )
+        self._finish_toast: Optional[FinishToast] = None
 
         self.output_selection_button = QPushButton("Output Selection")
         self.output_selection_button.clicked.connect(
@@ -2691,6 +2825,7 @@ class OrganelleContactWidget(QWidget):
         contact_group_layout.addLayout(voxel_cal_layout)
 
         contact_group_layout.addWidget(self.analyze_button)
+        contact_group_layout.addWidget(self.notify_finish_checkbox)
         contact_group_layout.addWidget(self.show_contacts_button)
         layout.addWidget(
             self._group_box("Contact Analysis", contact_group_layout)
@@ -2834,6 +2969,7 @@ class OrganelleContactWidget(QWidget):
             "fill_skeleton_holes": (
                 self.fill_skeleton_holes_checkbox.isChecked()
             ),
+            "notify_on_finish": self.notify_finish_checkbox.isChecked(),
             "filter_body_metrics": (
                 self.filter_body_metrics_checkbox.isChecked()
             ),
@@ -3042,6 +3178,9 @@ class OrganelleContactWidget(QWidget):
             )
             self.fill_skeleton_holes_checkbox.setChecked(
                 bool(data.get("fill_skeleton_holes", True))
+            )
+            self.notify_finish_checkbox.setChecked(
+                bool(data.get("notify_on_finish", True))
             )
             self.filter_threshold_mask_checkbox.setChecked(
                 bool(data.get("filter_threshold_mask", False))
@@ -3913,13 +4052,64 @@ class OrganelleContactWidget(QWidget):
 
     # ---------------- Analysis ----------------
     def analyze_contacts(self):
+        """Run the analysis (_run_analysis), then show the finish notice
+        if it is switched on: on success, and on an error raised
+        mid-analysis (which still propagates). Not for an analysis that
+        never started (its warning dialog already says why)."""
+        t0 = time.perf_counter()
+        try:
+            started = self._run_analysis()
+        except Exception as e:
+            self._notify_analysis_finished(
+                ok=False,
+                detail=f"{type(e).__name__}: {e}",
+                elapsed=time.perf_counter() - t0,
+            )
+            raise
+        if started:
+            self._notify_analysis_finished(
+                ok=True, detail=None, elapsed=time.perf_counter() - t0
+            )
+
+    def _notify_analysis_finished(
+        self, ok: bool, detail: Optional[str], elapsed: float
+    ) -> None:
+        cb = getattr(self, "notify_finish_checkbox", None)
+        if cb is None or not cb.isChecked():
+            return
+        try:
+            if ok:
+                title = "LocA \u2014 analysis finished"
+                layer = getattr(self, "_last_base_layer", None)
+                parts = [getattr(layer, "name", None) or "image"]
+                if isinstance(self.last_metrics, list):
+                    k = len(self.last_metrics)
+                    parts.append(f"{k} ROI" + ("" if k == 1 else "s"))
+                parts.append(f"{elapsed:.1f} s")
+                body = " \u00b7 ".join(parts)
+            else:
+                title = "LocA \u2014 analysis failed"
+                body = detail or "see the napari console"
+            old = self._finish_toast
+            if old is not None:
+                with contextlib.suppress(RuntimeError):  # already deleted
+                    old.close()
+            self._finish_toast = FinishToast(self, title, body, ok=ok)
+            self._finish_toast.popup()
+        except Exception as e:
+            # A notice must never break an analysis.
+            print(f"Warning: finish notification failed: {e}")
+
+    def _run_analysis(self) -> bool:
+        """The analysis itself. Returns False if it could not start
+        (no usable layers), True once it has finished."""
         try:
             raw_signals, norm_signals, base_layer = (
                 self._get_signals_for_analysis()
             )
         except Exception as e:
             QMessageBox.warning(self, "Analyze", str(e))
-            return
+            return False
 
         self._last_base_layer = base_layer
 
@@ -4144,6 +4334,7 @@ class OrganelleContactWidget(QWidget):
 
         if sel.get("contacts", True):
             self._update_contacts_layer(contacts_display, base_layer)
+        return True
 
     def _region_mask_from_mode(
         self,

@@ -16,6 +16,11 @@ numbers follow [Semantic Versioning](https://semver.org/).
   Network columns; existing outputs are unchanged. Definitions were checked
   against MiNA's and AnalyzeSkeleton's source; see Metric Descriptions for
   how LocA's measurements differ from MiNA's.
+- Finish notice: when an analysis finishes (or fails), a small card slides
+  into the top-right corner of the screen napari is on, stays a few seconds
+  and slides out, so you can work in another app while LocA runs. Click it
+  to dismiss. Switch it off with "Notify me when an analysis finishes"
+  under the Analyze button (remembered between sessions).
 
 ## [0.1.0] - 2026-10-07
 
