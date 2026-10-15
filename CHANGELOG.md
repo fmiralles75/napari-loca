@@ -6,6 +6,17 @@ numbers follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- MiNA's network statistics as Morphology Network outputs (per channel,
+  per image or ROI): Summed Branch Length Mean and Median (each body's total
+  skeleton length), Pooled Branch Length Mean and Median (every branch
+  pooled, MiNA's "branch length"), Branch Count Median, and Donut Count
+  (bodies whose skeleton has no free end). They come after the existing
+  Network columns; existing outputs are unchanged. Definitions were checked
+  against MiNA's and AnalyzeSkeleton's source; see Metric Descriptions for
+  how LocA's measurements differ from MiNA's.
+
 ## [0.1.0] - 2026-10-07
 
 First public release.

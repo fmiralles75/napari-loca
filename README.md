@@ -22,7 +22,7 @@ For 2–4 channels, per image or per hand-drawn ROI (e.g. per cell):
 | **Overlap** | Intersection, Union, Intersection/Union (Jaccard), Intersection / each channel's signal area |
 | **Contacts** | Contact Area within a user-set distance (Z weighted by the voxel calibration), Contact Site Count, Mean Contact Site Size, Contact Site nearest-neighbour distance, mean intensity at contacts |
 | **Per-channel area** | Signal Area, Body Count, Average Area per Body, Fragmentation Coefficient |
-| **Morphology** (opt-in) | Aspect Ratio and Form Factor per body; skeleton-based Branch Count, Junction Count and Branch Length; % of bodies / signal in branched bodies |
+| **Morphology** (opt-in) | Aspect Ratio and Form Factor per body; skeleton-based Branch Count, Junction Count and Branch Length; MiNA's network statistics (summed and pooled branch length, medians, donut count); % of bodies / signal in branched bodies |
 | **Intensity** | Mean intensity per channel, plus custom comparisons (one channel's intensity inside another's mask, contacts, etc.) |
 | **Cell (ROI) shape** | Max/Min Feret diameter, Perimeter, Circularity, Roundness, Solidity (same definitions as Fiji) |
 
@@ -82,6 +82,10 @@ LIF readers are GPL-licensed and therefore optional:
   Use ROIs, and check the thresholded layers.
 - Skeleton metrics (branches, junctions) depend on the segmentation; inspect
   the Skeleton and Junction layers before trusting them.
+- LocA's network statistics follow MiNA's definitions but count per body
+  rather than per skeleton network, and measure branches up to junctions
+  rather than through them, so values are close to MiNA's but not
+  identical (see Metric Descriptions in the plugin).
 - With 3–4 channels, the default *Overlap-based* contacts method requires all
   but one channel to overlap exactly, so three organelles close together
   without overlapping are not counted. Choose *Focus channel* instead to

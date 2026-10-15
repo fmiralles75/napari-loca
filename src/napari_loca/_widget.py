@@ -546,6 +546,43 @@ def skeleton_branch_lengths(
     return out
 
 
+def skeleton_endpoints(
+    skel: np.ndarray, labels: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """Flat indices of the skeleton pixels that have at most one skeleton
+    neighbour (full/diagonal connectivity): branch tips, plus isolated
+    single-pixel skeletons. This is AnalyzeSkeleton's "end-point" class
+    (fewer than 2 neighbours). With ``labels`` (body labels), only
+    neighbours in the same body count, so a body's tip that happens to
+    touch another body's skeleton diagonally is still a tip. A body
+    whose skeleton has none of these has no free ends -- MiNA's donut
+    test. Works on the skeleton's own pixels only, so it costs little
+    even on a full 3D stack."""
+    skel = np.asarray(skel, dtype=bool)
+    lin = np.flatnonzero(skel)  # sorted
+    if lin.size == 0:
+        return lin
+    shape = skel.shape
+    coords = np.column_stack(np.unravel_index(lin, shape))
+    lab = None if labels is None else np.asarray(labels).ravel()[lin]
+    count = np.zeros(lin.size, dtype=np.int32)
+    for o in np.argwhere(np.ones((3,) * skel.ndim)) - 1:
+        if not o.any():
+            continue
+        nb = coords + o
+        ok = np.all((nb >= 0) & (nb < shape), axis=1)
+        if not ok.any():
+            continue
+        src = np.nonzero(ok)[0]
+        nlin = np.ravel_multi_index(tuple(nb[ok].T), shape)
+        pos = np.minimum(np.searchsorted(lin, nlin), lin.size - 1)
+        hit = lin[pos] == nlin
+        if lab is not None:
+            hit &= lab[pos] == lab[src]
+        count[src[hit]] += 1
+    return lin[count <= 1]
+
+
 def compute_roi_geometry(poly_data: np.ndarray):
     """Feret (caliper) diameters of an ROI polygon, in XY pixels.
 
@@ -1085,7 +1122,46 @@ count as one junction. Branch Length is the length of the path through
 the branch's pixel centers (1 per straight step, &radic;2 per diagonal,
 Z steps weighted by the Z/XY calibration) plus one pixel for the end caps,
 in XY pixels &mdash; multiply by the pixel size for &micro;m. It does not
-depend on which way a branch is oriented.</p>
+depend on which way a branch is oriented. Junction pixels belong to no
+branch, so a branch is measured up to the junction, not through it.
+<b>Branch Length Mean</b> is a mean of means: each body's own mean branch
+length, averaged over bodies (bodies with no branch count as 0).</p>
+<p><b>MiNA's network outputs.</b> MiNA counts per skeleton network; LocA
+counts per body. They are the same thing except where two bodies touch
+only diagonally, which MiNA's skeleton joins into one network.</p>
+<ul>
+<li><b>Summed Branch Length Mean / Median</b> &mdash; each body's total
+skeleton length, averaged (or the median) over bodies. The mean equals
+total skeleton length / Body Count. MiNA: "summed branch lengths".</li>
+<li><b>Pooled Branch Length Mean / Median</b> &mdash; every branch in the
+image or ROI pooled together, whichever body it is in. MiNA: "branch
+length". Differs from Branch Length Mean whenever bodies have different
+numbers of branches: there, a 1-branch rod counts as much as a
+20-branch network; here, each branch counts once. The pooled mean equals
+Summed Branch Length Mean / Branch Count Mean.</li>
+<li><b>Branch Count Median</b> &mdash; median branches per body. MiNA:
+"network branches" (median; Branch Count Mean is its mean).</li>
+<li><b>Donut Count</b> &mdash; number of bodies whose skeleton has at
+least one branch and no free end (no skeleton pixel with fewer than two
+skeleton neighbors in the same body). Junctions are allowed, as in MiNA:
+a ring, a ring with a chord across it, or two joined rings all count; a
+ring with a spur does not. "Fill small holes before skeletonizing"
+fills a ring's lumen if it is 16 pixels or less, so only rings with a
+larger lumen can count; with the fill off, every ring counts.</li>
+</ul>
+<p>Medians are robust to the many short branches a skeleton of a noisy
+mask produces; when mean and median disagree a lot, short branches are
+dominating the mean. There are no SD outputs. All of these are 0 when
+there is nothing to measure (no bodies, or no branches).</p>
+<p><i>Lengths compared with MiNA:</i> branch and junction counts and
+donuts agree with Fiji's AnalyzeSkeleton (which MiNA uses) on the same
+skeleton, but lengths follow LocA's convention. LocA reports XY pixels
+(MiNA: calibrated units), adds one pixel of end caps (an unbranched rod
+is 1 px longer than in MiNA) and stops each branch before the junction
+pixels (MiNA measures to the junction, so a branch ending at a junction
+is about 1&ndash;2 px longer there). On branched networks LocA's lengths
+are therefore somewhat shorter than MiNA's. Compare conditions within
+LocA, not LocA numbers with MiNA numbers.</p>
 <p><b>Fill small holes before skeletonizing</b> (Morphology section, on
 by default) &mdash; skeletonization keeps a loop around every hole in a
 body and a closed shell around every enclosed cavity, so dim voxels left
@@ -1485,8 +1561,9 @@ class OutputSelectionDialog(QDialog):
             "mean per body)"
         )
         self.cb_morph_network = QCheckBox(
-            "Network: Branch Count / Junction Count / Branch Length "
-            "(skeleton-based)"
+            "Network: Branch Count / Junction Count / Branch Length, "
+            "Summed and Pooled Branch Length, Donut Count "
+            "(skeleton-based; covers MiNA's outputs)"
         )
         morph_note = QLabel(
             "Both require the body labeling used by Fragmentation "
@@ -4605,6 +4682,10 @@ class OrganelleContactWidget(QWidget):
                 junction_counts = np.zeros(n_bodies_i + 1, dtype=np.float64)
                 branch_len_totals = np.zeros(n_bodies_i + 1, dtype=np.float64)
                 body_areas = np.zeros(n_bodies_i + 1, dtype=np.float64)
+                # MiNA-style outputs: every counted branch's length,
+                # pooled across bodies, and which bodies have a free end.
+                kept_branch_len = np.zeros(0, dtype=np.float64)
+                body_has_endpoint = np.zeros(n_bodies_i + 1, dtype=bool)
 
                 if n_bodies_i > 0:
                     try:
@@ -4649,6 +4730,17 @@ class OrganelleContactWidget(QWidget):
                                 frag_body[valid],
                                 frag_len[valid],
                             )
+                            kept_branch_len = np.asarray(
+                                frag_len[valid], dtype=np.float64
+                            )
+
+                        end_body = skel_labels_i.ravel()[
+                            skeleton_endpoints(skel, skel_labels_i)
+                        ]
+                        end_body = end_body[
+                            (end_body >= 1) & (end_body <= n_bodies_i)
+                        ]
+                        body_has_endpoint[end_body] = True
 
                         if jg["n_groups"] > 0:
                             junc_body = jg["group_body"]
@@ -4718,6 +4810,46 @@ class OrganelleContactWidget(QWidget):
                     f"% Signal Area in Junction-Containing Bodies "
                     f"({ch_labels[i]})"
                 ] = pct_area_with_junction
+
+                # MiNA's network statistics (MiNA_Analyze_Morphology.py),
+                # with LocA's body in place of MiNA's skeleton graph.
+                # Appended after the outputs above so existing columns
+                # keep their positions. Same empty-result convention as
+                # the rest of this family: 0.0 when nothing to average.
+                def _median0(a: np.ndarray) -> float:
+                    return float(np.median(a)) if a.size else 0.0
+
+                # "summed branch lengths": each body's total skeleton
+                # length (= total length / Body Count for the mean).
+                sbl_mean, _, _ = self._mean_sd_wmean(
+                    list(b_len_totals), list(b_areas)
+                )
+                out[f"Summed Branch Length Mean ({ch_labels[i]})"] = sbl_mean
+                out[f"Summed Branch Length Median ({ch_labels[i]})"] = (
+                    _median0(b_len_totals)
+                )
+                # "branch length": every branch pooled, whichever body it
+                # is in. Branch Length Mean above is instead the mean of
+                # each body's own mean.
+                out[f"Pooled Branch Length Mean ({ch_labels[i]})"] = (
+                    float(np.mean(kept_branch_len))
+                    if kept_branch_len.size
+                    else 0.0
+                )
+                out[f"Pooled Branch Length Median ({ch_labels[i]})"] = (
+                    _median0(kept_branch_len)
+                )
+                # "network branches": branches per body.
+                out[f"Branch Count Median ({ch_labels[i]})"] = _median0(
+                    b_counts
+                )
+                # "donuts": bodies with at least one branch and no free
+                # end anywhere in their skeleton (junctions allowed).
+                out[f"Donut Count ({ch_labels[i]})"] = int(
+                    np.sum(
+                        (b_counts > 0) & ~body_has_endpoint[1 : n_bodies_i + 1]
+                    )
+                )
 
         if roi_area is not None and self.output_selection.get(
             "ROI Area", True
